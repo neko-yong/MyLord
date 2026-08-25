@@ -15,6 +15,7 @@ from db import (
     StatementAlreadySubmitted,
 )
 from dev_fixtures import fixture_options, get_fixture
+from dev_memory_db import DevMemoryDatabase, new_dev_local_store
 from dev_tools import (
     FAILURE_STAGES,
     SCENARIOS,
@@ -228,6 +229,11 @@ def observe_fragment(name):
 
 settings = _load_server_settings()
 st.session_state.setdefault("auth", None)
+if settings.dev_mode:
+    st.session_state.setdefault(
+        "dev_database_mode",
+        settings.dev_database_mode,
+    )
 
 
 def selected_llm_mode():
@@ -236,6 +242,20 @@ def selected_llm_mode():
     mode = st.session_state.get("dev_llm_mode", settings.llm_mode)
     if mode not in {"mock", "real"}:
         raise LLMError("dev_llm_mode", "Invalid developer LLM mode.")
+    return mode
+
+
+def selected_database_mode():
+    if not settings.dev_mode:
+        return "postgres"
+    mode = st.session_state.get(
+        "dev_database_mode",
+        settings.dev_database_mode,
+    )
+    if mode == "real":
+        mode = "postgres"
+    if mode not in {"local", "postgres"}:
+        raise PermissionError("Invalid developer database mode.")
     return mode
 
 
@@ -288,10 +308,26 @@ def clear_dev_case_state():
     for key in (
         "dev_case",
         "dev_view_role",
+        "dev_role_selector",
         "dev_mock_calls",
         "dev_failure_state",
     ):
         st.session_state.pop(key, None)
+    for key in tuple(st.session_state):
+        if str(key).startswith("_message_cache_"):
+            st.session_state.pop(key, None)
+
+
+def prepare_database_mode():
+    mode = selected_database_mode()
+    if not settings.dev_mode:
+        return mode
+    previous = st.session_state.get("_dev_database_mode_active")
+    if previous is not None and previous != mode:
+        clear_dev_case_state()
+        st.session_state["_dev_database_mode_changed"] = True
+    st.session_state["_dev_database_mode_active"] = mode
+    return mode
 
 
 def render_developer_playground():
@@ -299,6 +335,8 @@ def render_developer_playground():
         return
 
     fixture_by_label = fixture_options()
+    if st.session_state.pop("_dev_reset_pending", False):
+        st.session_state.dev_failure_stage = "NONE"
     st.session_state.setdefault("dev_llm_mode", settings.llm_mode)
     st.session_state.setdefault("dev_fixture_label", next(iter(fixture_by_label)))
     st.session_state.setdefault("dev_scenario", "MEDIATING")
@@ -306,6 +344,45 @@ def render_developer_playground():
     st.session_state.setdefault("dev_real_llm_confirmed", False)
 
     with st.sidebar.expander("🛠 Developer Playground", expanded=False):
+        database_mode = st.segmented_control(
+            "Database Mode",
+            ("local", "postgres"),
+            format_func=lambda value: (
+                "⚡ Fast Local" if value == "local" else "🌐 Real PostgreSQL"
+            ),
+            key="dev_database_mode",
+            required=True,
+            width="stretch",
+        )
+        if database_mode not in {"local", "postgres"}:
+            st.error("数据库模式无效。")
+            st.stop()
+
+        with st.container(horizontal=True):
+            st.badge("DEV_MODE: ON", color="green")
+            st.badge(
+                f"LLM: {selected_llm_mode().title()}",
+                color="blue",
+            )
+            st.badge(
+                "Database: Fast Local"
+                if database_mode == "local"
+                else "Database: Real PostgreSQL",
+                color="green" if database_mode == "local" else "orange",
+            )
+
+        if st.session_state.pop("_dev_database_mode_changed", False):
+            st.warning("切换数据库模式后，需要创建新的测试案件。")
+        if database_mode == "local":
+            st.info(
+                "Fast Local：仅当前开发 Session；无公网数据库请求，"
+                "用于 UI / workflow development only。"
+            )
+        else:
+            st.warning(
+                "⚠ 当前操作将访问远程 PostgreSQL，响应速度会明显慢于 Fast Local。"
+            )
+
         fixture_label = st.selectbox(
             "Fixture",
             tuple(fixture_by_label),
@@ -328,8 +405,6 @@ def render_developer_playground():
             format_func=lambda value: "无" if value == "NONE" else value,
             key="dev_failure_stage",
         )
-        st.caption("Database：当前连接 · Real PostgreSQL")
-
         previous_failure = st.session_state.get("dev_failure_state", {})
         if previous_failure.get("stage") != failure_stage:
             st.session_state.dev_failure_state = {
@@ -346,6 +421,17 @@ def render_developer_playground():
             )
         else:
             st.session_state.dev_real_llm_confirmed = False
+
+        if database_mode == "local" and st.button(
+            "Reset Local Playground",
+            icon=":material/restart_alt:",
+            width="stretch",
+            key="dev_reset_local",
+        ):
+            database.reset()
+            clear_dev_case_state()
+            st.session_state._dev_reset_pending = True
+            st.rerun()
 
         if st.button(
             "创建测试案件",
@@ -504,7 +590,10 @@ st.caption("独立陈述 → 争议地图 → 共享调解 → 暂停 / 恢复 �
 
 service_status = st.sidebar.container()
 
-if not settings.database_url:
+database_mode = prepare_database_mode()
+AUTO_REFRESH_INTERVAL = None if database_mode == "local" else "2s"
+
+if database_mode == "postgres" and not settings.database_url:
     with service_status:
         st.subheader("服务状态")
         st.badge("数据库未配置", color="red", icon=":material/database:")
@@ -519,22 +608,34 @@ if not settings.database_url:
     st.caption("生产环境不会自动回落到本地 SQLite。")
     st.stop()
 
-try:
-    with st.spinner("正在连接共享数据库…"):
-        database = get_database(settings.database_url)
-except DatabaseError as error:
-    with service_status:
-        st.subheader("服务状态")
-        st.badge("数据库连接失败", color="red", icon=":material/database:")
-    show_database_error(error)
-    st.stop()
+if database_mode == "local":
+    if "_dev_local_store" not in st.session_state:
+        st.session_state._dev_local_store = new_dev_local_store(settings)
+    database = DevMemoryDatabase(
+        settings,
+        st.session_state._dev_local_store,
+        database_mode=database_mode,
+    )
+else:
+    try:
+        with st.spinner("正在连接共享数据库…"):
+            database = get_database(settings.database_url)
+    except DatabaseError as error:
+        with service_status:
+            st.subheader("服务状态")
+            st.badge("数据库连接失败", color="red", icon=":material/database:")
+        show_database_error(error)
+        st.stop()
 
 render_developer_playground()
 auth = current_auth()
 
 with service_status:
     st.subheader("服务状态")
-    st.badge("数据库已连接", color="green", icon=":material/database:")
+    if database_mode == "local":
+        st.badge("Fast Local 已就绪", color="green", icon=":material/bolt:")
+    else:
+        st.badge("数据库已连接", color="green", icon=":material/database:")
     if settings.llm_ready:
         st.badge("AI 法官已就绪", color="green", icon=":material/smart_toy:")
     else:
@@ -674,7 +775,7 @@ other = "B" if role == "A" else "A"
 st.subheader(case["title"])
 
 
-@st.fragment(run_every="2s")
+@st.fragment(run_every=AUTO_REFRESH_INTERVAL)
 @observe_fragment("case_overview")
 def live_case_overview():
     try:
@@ -701,7 +802,13 @@ def live_case_overview():
             "B 已提交" if submitted["B"] else "B 待提交",
             color="green" if submitted["B"] else "gray",
         )
-    st.caption("页面每 2 秒同步案件状态；对方的独立陈述正文不会显示。")
+    if database_mode == "local":
+        st.caption(
+            "Fast Local 通过当前 Session 的页面操作刷新状态；"
+            "对方的独立陈述正文不会显示。"
+        )
+    else:
+        st.caption("页面每 2 秒同步案件状态；对方的独立陈述正文不会显示。")
 
 
 live_case_overview()
@@ -878,7 +985,7 @@ if tabs[2].open:
     with tabs[2]:
         st.markdown("### 共享调解室")
 
-        @st.fragment(run_every="2s")
+        @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
         @observe_fragment("mediation_room")
         def shared_mediation_room():
             message_cache_key = f"_message_cache_{case_id}"
@@ -1073,7 +1180,7 @@ if tabs[3].open:
             meta_checkpoint = None
             evidence = None
 
-        @st.fragment(run_every="2s")
+        @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
         @observe_fragment("final_arbitration")
         def sync_final_arbitration(rendered_status, rendered_final_ready):
             try:

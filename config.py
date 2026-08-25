@@ -14,7 +14,7 @@ class Settings:
     development_mode: bool = False
     dev_mode: bool = False
     llm_mode: str = "real"
-    dev_database_mode: str = "real"
+    dev_database_mode: str = "postgres"
 
     @property
     def llm_ready(self):
@@ -62,10 +62,14 @@ def _dev_llm_mode(dev_mode, secrets_values, environ):
 def _dev_database_mode(dev_mode, secrets_values, environ):
     configured = _value("DEV_DATABASE_MODE", secrets_values, environ).lower()
     if not dev_mode:
-        return "real"
-    mode = configured or "real"
-    if mode != "real":
-        raise ValueError("DEV_DATABASE_MODE currently supports only real.")
+        return "postgres"
+    mode = configured or "local"
+    if mode == "real":
+        mode = "postgres"
+    if mode not in {"local", "postgres"}:
+        raise ValueError(
+            "DEV_DATABASE_MODE must be either local or postgres in DEV_MODE."
+        )
     return mode
 
 

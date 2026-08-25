@@ -96,7 +96,7 @@ DEVELOPMENT_MODE = true
 # Local developer tooling only. Never enable on the production deployment.
 DEV_MODE = false
 LLM_MODE = "real"
-DEV_DATABASE_MODE = "real"
+DEV_DATABASE_MODE = "postgres"
 ```
 
 同名环境变量也可用于本地开发；Streamlit Secrets 优先于环境变量。
@@ -165,7 +165,7 @@ ADMIN_CREATE_SECRET = "YOUR_ADMIN_CREATE_SECRET"
 DEVELOPMENT_MODE = false
 DEV_MODE = false
 LLM_MODE = "real"
-DEV_DATABASE_MODE = "real"
+DEV_DATABASE_MODE = "postgres"
 ```
 
 不要把 `.streamlit/secrets.toml` 提交到 GitHub。公开部署保持 `DEVELOPMENT_MODE = false`，避免向普通用户显示技术诊断信息。
@@ -233,23 +233,43 @@ Developer Playground 只用于本地或独立测试部署，提供标准虚构 F
 是服务端 `DEV_MODE`。所有测试案件使用 `[DEV_TEST]` 标题前缀，删除和身份
 切换会在服务端再次校验此前缀。
 
+`DEV_MODE` 是 Developer Playground 的服务端总开关。旧的
+`DEVELOPMENT_MODE` 只控制少量错误诊断显示，不会启用 Playground、Fast
+Local、Mock、身份切换或失败注入。
+
 ### DEV_FAST
 
 ```toml
 DEV_MODE = true
+DEV_DATABASE_MODE = "local"
 LLM_MODE = "mock"
-DEV_DATABASE_MODE = "real"
 ```
 
-用于表单、UI 和状态机开发。Fixture 数据与 Mock 输出不会调用 DeepSeek，
-通常可在几十秒内直接到达 `MEDIATING`、`ARBITRATING` 或 `CLOSED`。
+用于日常表单、UI 和状态机开发。Fixture、案件、消息和 Artifact 只保存在
+当前 Streamlit Session 的内存中；不会连接 PostgreSQL，也不会调用
+DeepSeek。Local wrapper 每次 rerun 重新创建，不使用 `st.cache_resource`；
+实际数据保存在当前 Session 的 `_dev_local_store` 中。
+
+Fast Local 不跨浏览器共享，也不能证明 PostgreSQL 事务、`FOR UPDATE`、连接池
+或跨客户端同步正确。它只用于 UI / workflow development。
+
+### DEV_LLM
+
+```toml
+DEV_MODE = true
+DEV_DATABASE_MODE = "local"
+LLM_MODE = "real"
+```
+
+使用 Fast Local 数据测试正式 Prompt / Real LLM，不写远程数据库。Playground
+会显示费用警告，并要求当前 Session 明确确认真实模型调用。
 
 ### DEV_INTEGRATION
 
 ```toml
 DEV_MODE = true
+DEV_DATABASE_MODE = "postgres"
 LLM_MODE = "mock"
-DEV_DATABASE_MODE = "real"
 ```
 
 连接真实测试 PostgreSQL，用于并发、Evidence Freeze、checkpoint 恢复和
@@ -260,12 +280,21 @@ DEV_DATABASE_MODE = "real"
 
 ```toml
 DEV_MODE = false
+DEV_DATABASE_MODE = "postgres"
 LLM_MODE = "real"
-DEV_DATABASE_MODE = "real"
 ```
 
 使用真实 PostgreSQL 与真实 DeepSeek 完成发布前冒烟。正式 Streamlit Cloud
 Secrets 绝不能设置 `DEV_MODE = true`，除非该部署明确是隔离测试环境。
+当 `DEV_MODE = false` 时，即使误配 `DEV_DATABASE_MODE = "local"` 或
+`LLM_MODE = "mock"`，运行时仍会强制使用 PostgreSQL 与 Real LLM。
+
+| Mode | Database | LLM | 用途 |
+|---|---|---|---|
+| DEV_FAST | Fast Local | Mock | 日常 UI / workflow 开发 |
+| DEV_LLM | Fast Local | Real | Prompt / 模型集成测试 |
+| DEV_INTEGRATION | Real PostgreSQL | Mock | 数据库事务与并发测试 |
+| RELEASE | Real PostgreSQL | Real | 正式发布路径 |
 
 Playground 中选择 **Real** 会显示费用警告并要求本次会话确认；默认始终是
 **Mock**。真实模式继续使用现有正式 Prompt、DeepSeek 配置、token budget 与

@@ -43,6 +43,7 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(settings.admin_create_ready)
         self.assertFalse(settings.dev_mode)
         self.assertEqual(settings.llm_mode, "real")
+        self.assertEqual(settings.dev_database_mode, "postgres")
 
     def test_dev_mode_accepts_only_explicit_boolean_values(self):
         truthy = (True, 1, "1", "true", "TRUE", "yes", " YES ")
@@ -53,12 +54,14 @@ class SettingsTests(unittest.TestCase):
                 settings = load_settings({"DEV_MODE": value}, {})
                 self.assertTrue(settings.dev_mode)
                 self.assertEqual(settings.llm_mode, "mock")
+                self.assertEqual(settings.dev_database_mode, "local")
 
         for value in falsey:
             with self.subTest(value=value):
                 settings = load_settings({"DEV_MODE": value}, {})
                 self.assertFalse(settings.dev_mode)
                 self.assertEqual(settings.llm_mode, "real")
+                self.assertEqual(settings.dev_database_mode, "postgres")
 
         for value in ("on", "off", "enabled", "disabled", "2"):
             with self.subTest(value=value):
@@ -67,12 +70,17 @@ class SettingsTests(unittest.TestCase):
 
     def test_production_forces_real_llm_even_if_mock_is_configured(self):
         settings = load_settings(
-            {"DEV_MODE": "false", "LLM_MODE": "mock"},
+            {
+                "DEV_MODE": "false",
+                "LLM_MODE": "mock",
+                "DEV_DATABASE_MODE": "local",
+            },
             {},
         )
 
         self.assertFalse(settings.dev_mode)
         self.assertEqual(settings.llm_mode, "real")
+        self.assertEqual(settings.dev_database_mode, "postgres")
 
     def test_dev_llm_mode_is_strict_and_defaults_to_mock(self):
         self.assertEqual(
@@ -89,6 +97,31 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_settings(
                 {"DEV_MODE": "true", "LLM_MODE": "surprise"},
+                {},
+            )
+
+    def test_dev_database_mode_defaults_local_and_maps_legacy_real(self):
+        self.assertEqual(
+            load_settings({"DEV_MODE": "true"}, {}).dev_database_mode,
+            "local",
+        )
+        self.assertEqual(
+            load_settings(
+                {"DEV_MODE": "true", "DEV_DATABASE_MODE": "postgres"},
+                {},
+            ).dev_database_mode,
+            "postgres",
+        )
+        self.assertEqual(
+            load_settings(
+                {"DEV_MODE": "true", "DEV_DATABASE_MODE": "real"},
+                {},
+            ).dev_database_mode,
+            "postgres",
+        )
+        with self.assertRaises(ValueError):
+            load_settings(
+                {"DEV_MODE": "true", "DEV_DATABASE_MODE": "sqlite"},
                 {},
             )
 

@@ -327,13 +327,40 @@ class DevScenarioTests(unittest.TestCase):
         project = Path(__file__).resolve().parents[1]
         source = "\n".join(
             (project / name).read_text(encoding="utf-8")
-            for name in ("app.py", "dev_tools.py", "mock_llm.py")
+            for name in (
+                "app.py",
+                "dev_tools.py",
+                "dev_memory_db.py",
+                "mock_llm.py",
+            )
         )
 
         self.assertNotIn("query_params", source)
         self.assertNotIn("?dev=true", source.lower())
         self.assertNotIn("?debug=true", source.lower())
+        self.assertNotIn("?database=local", source.lower())
+        self.assertNotIn("?llm=mock", source.lower())
         self.assertNotIn("ADMIN_CREATE_SECRET", source)
+
+    def test_fast_local_disables_only_automatic_fragment_polling(self):
+        project = Path(__file__).resolve().parents[1]
+        app_source = (project / "app.py").read_text(encoding="utf-8")
+        memory_source = (project / "dev_memory_db.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'AUTO_REFRESH_INTERVAL = None if database_mode == "local" else "2s"',
+            app_source,
+        )
+        self.assertEqual(
+            app_source.count(
+                "@st.fragment(run_every=AUTO_REFRESH_INTERVAL)"
+            ),
+            3,
+        )
+        self.assertNotIn("@st.fragment(run_every=\"2s\")", app_source)
+        self.assertNotIn("cache_resource", memory_source)
 
     def test_production_blocks_seed_role_switch_state_and_delete(self):
         for operation in (

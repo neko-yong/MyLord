@@ -3,11 +3,11 @@ from dataclasses import dataclass
 from arbitration import run_final_arbitration
 from db import DatabaseUnavailable
 from dev_fixtures import get_fixture
+from dev_memory_db import DEV_TITLE_PREFIX
 from mock_llm import MockLLM, require_dev_mode
 from validation import build_statement_content, validate_statement_fields
 
 
-DEV_TITLE_PREFIX = "[DEV_TEST] "
 SCENARIOS = (
     "EMPTY",
     "A_SUBMITTED",
