@@ -5,6 +5,7 @@ from functools import wraps
 
 import streamlit as st
 
+from admin_console import is_admin_route, render_admin_console
 from arbitration import retry_database_write, run_final_arbitration
 from config import load_settings, secure_secret_matches
 from database_resources import get_database
@@ -594,6 +595,9 @@ def observe_fragment(name):
 
 settings = _load_server_settings()
 st.session_state.setdefault("auth", None)
+if is_admin_route(st.query_params, settings.admin_console_route_key):
+    render_admin_console(settings)
+    st.stop()
 if settings.dev_mode:
     st.session_state.setdefault(
         "dev_database_mode",

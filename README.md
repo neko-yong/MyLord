@@ -91,6 +91,8 @@ LLM_MODEL = "your-model"
 LLM_API_KEY = "YOUR_API_KEY"
 
 ADMIN_CREATE_SECRET = "YOUR_ADMIN_CREATE_SECRET"
+ADMIN_CONSOLE_ROUTE_KEY = "YOUR_UNGUESSABLE_ROUTE_KEY"
+ADMIN_MAINTENANCE_SECRET = "YOUR_MAINTENANCE_SECRET"
 DEVELOPMENT_MODE = true
 
 # Local developer tooling only. Never enable on the production deployment.
@@ -110,6 +112,26 @@ python -m streamlit run app.py
 打开 `http://localhost:8501`。
 
 如果未设置 `DATABASE_URL`，应用会显示“数据库尚未配置”，不会建立本地数据库。LLM Secrets 未配置时仍可进入案件并完成双方独立陈述，但不能生成 AI 内容。
+
+## Production Case Maintenance Console
+
+生产案件维护后台是独立的隐藏视图。配置两个互不替代的服务端 Secret：
+
+- `ADMIN_CONSOLE_ROUTE_KEY`：仅用于降低入口曝光；它不是权限边界。
+- `ADMIN_MAINTENANCE_SECRET`：实际的后台认证凭据，只保存在当前 Streamlit Session 的认证状态中。
+
+配置完成后，运维人员访问 `?console=<ADMIN_CONSOLE_ROUTE_KEY>`，再输入
+`ADMIN_MAINTENANCE_SECRET`。不要把真实 route key、maintenance secret 或完整后台
+URL 写进仓库、日志、截图或公开文档。任一配置缺失都不会影响普通用户页面。
+
+后台只显示 Case ID、状态、创建时间和最近活动时间，列表每页 25 条，并支持完整
+Case ID 精确查询。它不会查询或展示标题、陈述、消息、仲裁正文、Evidence、A/B
+Token 或 Token Hash。
+
+永久删除只能从精确查询结果发起。第一次点击后，必须逐字输入完整 Case ID，才能
+执行最终删除。删除在一个 PostgreSQL transaction 中删除唯一父 Case，依赖现有
+`ON DELETE CASCADE` 清理关联记录，并在提交前验证所有 Case-linked 表 residual
+均为 0。该操作不可恢复，执行前应确认目标 ID 和备份策略。
 
 # Public Deployment
 
@@ -162,6 +184,8 @@ LLM_MODEL = "your-model"
 LLM_API_KEY = "YOUR_API_KEY"
 
 ADMIN_CREATE_SECRET = "YOUR_ADMIN_CREATE_SECRET"
+ADMIN_CONSOLE_ROUTE_KEY = "YOUR_UNGUESSABLE_ROUTE_KEY"
+ADMIN_MAINTENANCE_SECRET = "YOUR_MAINTENANCE_SECRET"
 DEVELOPMENT_MODE = false
 DEV_MODE = false
 LLM_MODE = "real"

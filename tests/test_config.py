@@ -29,11 +29,14 @@ class SettingsTests(unittest.TestCase):
                 "LLM_MODEL": "test-model",
                 "LLM_API_KEY": "test-key",
                 "ADMIN_CREATE_SECRET": "admin-test",
+                "ADMIN_CONSOLE_ROUTE_KEY": "console-test",
+                "ADMIN_MAINTENANCE_SECRET": "maintenance-test",
             },
         )
 
         self.assertTrue(settings.llm_ready)
         self.assertTrue(settings.admin_create_ready)
+        self.assertTrue(settings.admin_console_ready)
         self.assertEqual(settings.database_url, "postgresql://environment-value")
 
     def test_missing_values_are_not_reported_ready(self):
@@ -43,6 +46,7 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(bool(settings.database_url))
         self.assertFalse(settings.llm_ready)
         self.assertFalse(settings.admin_create_ready)
+        self.assertFalse(settings.admin_console_ready)
         self.assertFalse(settings.dev_mode)
         self.assertEqual(settings.llm_mode, "real")
         self.assertEqual(settings.dev_database_mode, "postgres")
@@ -131,6 +135,19 @@ class SettingsTests(unittest.TestCase):
         self.assertTrue(secure_secret_matches("correct", "correct"))
         self.assertFalse(secure_secret_matches("wrong", "correct"))
         self.assertFalse(secure_secret_matches("", "correct"))
+
+    def test_admin_console_secrets_are_redacted_from_settings_repr(self):
+        settings = load_settings(
+            {
+                "ADMIN_CONSOLE_ROUTE_KEY": "ROUTE_CANARY_92X",
+                "ADMIN_MAINTENANCE_SECRET": "SECRET_CANARY_31K",
+            },
+            {},
+        )
+
+        self.assertTrue(settings.admin_console_ready)
+        self.assertNotIn("ROUTE_CANARY_92X", repr(settings))
+        self.assertNotIn("SECRET_CANARY_31K", repr(settings))
 
 
 if __name__ == "__main__":
