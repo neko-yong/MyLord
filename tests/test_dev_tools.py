@@ -357,7 +357,7 @@ class DevScenarioTests(unittest.TestCase):
             app_source.count(
                 "@st.fragment(run_every=AUTO_REFRESH_INTERVAL)"
             ),
-            3,
+            4,
         )
         self.assertNotIn("@st.fragment(run_every=\"2s\")", app_source)
         self.assertNotIn("cache_resource", memory_source)

@@ -5,6 +5,10 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 
+def inline_dialog(*_args, **_kwargs):
+    return lambda function: function
+
+
 class FakeStatementDatabase:
     def __init__(self):
         self.saved = {}
@@ -42,6 +46,9 @@ class FakeStatementDatabase:
     def save_statement(self, _case_id, role, content):
         self.saved[role] = content
 
+    def get_unread_notifications(self, _case_id, _role):
+        return []
+
 
 def app_environment(database):
     app_path = os.path.join(os.path.dirname(__file__), "..", "app.py")
@@ -61,6 +68,7 @@ def app_environment(database):
             return_value=False,
         ),
         patch("db.Database", return_value=database),
+        patch("streamlit.dialog", new=inline_dialog),
     )
 
 
@@ -70,6 +78,12 @@ def text_area(app, prefix):
 
 def submit_statement(app):
     button = next(button for button in app.button if button.label == "提交并冻结")
+    button.click()
+    return app.run(timeout=15)
+
+
+def confirm_statement(app):
+    button = next(button for button in app.button if button.label == "确认提交")
     button.click()
     return app.run(timeout=15)
 
@@ -101,7 +115,7 @@ class StatementValidationUITests(unittest.TestCase):
         database = FakeStatementDatabase()
         app, patches = self.run_app(database)
 
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app.run(timeout=15)
             labels = {area.label for area in app.text_area}
             self.assertTrue(
@@ -128,7 +142,7 @@ class StatementValidationUITests(unittest.TestCase):
         database = FakeStatementDatabase()
         app, patches = self.run_app(database)
 
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app.run(timeout=15)
             fill_valid_required_fields(app, omit="4.")
             submit_statement(app)
@@ -145,16 +159,32 @@ class StatementValidationUITests(unittest.TestCase):
         database = FakeStatementDatabase()
         app, patches = self.run_app(database)
 
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app.run(timeout=15)
             fill_valid_required_fields(app)
             submit_statement(app)
+            self.assertEqual(database.saved, {})
+            confirm_statement(app)
 
         self.assertIn("A", database.saved)
         self.assertEqual(database.saved["A"].count("（未提供）"), 4)
         successes = "\n".join(str(element.value) for element in app.success)
         self.assertIn("已经提交", successes)
         self.assertIn("当前版本已冻结", successes)
+
+    def test_open_and_cancel_confirmation_has_zero_writes(self):
+        database = FakeStatementDatabase()
+        app, patches = self.run_app(database)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            app.run(timeout=15)
+            fill_valid_required_fields(app)
+            submit_statement(app)
+            self.assertEqual(database.saved, {})
+            next(button for button in app.button if button.label == "取消").click()
+            app.run(timeout=15)
+
+        self.assertEqual(database.saved, {})
 
 
 if __name__ == "__main__":

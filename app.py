@@ -46,7 +46,7 @@ st.set_page_config(
 
 STATUS_LABELS = {
     "COLLECTING": "等待双方独立陈述",
-    "READY_FOR_MAP": "可以生成争议地图",
+    "READY_FOR_MAP": "正在整理争议地图",
     "MAP_READY": "争议地图已就绪",
     "MEDIATING": "共享调解中",
     "PAUSED": "调解已暂停",
@@ -85,10 +85,258 @@ def show_database_error(error):
 
 def show_llm_error(error):
     st.error("AI 法官暂时无法响应，请稍后重试。", icon=":material/error:")
-    st.toast("AI 法官调用失败，案件数据没有被写入。", icon=":material/error:")
+    st.toast(
+        "本次 AI 内容没有写入，已保存的案件数据不受影响。",
+        icon=":material/error:",
+    )
     if settings.development_mode:
         with st.expander("开发信息", icon=":material/code:"):
             st.code(error.debug_summary())
+
+
+CONFIRMATION_COPY = {
+    "statement": {
+        "heading": "确认提交并冻结？",
+        "body": (
+            "提交后，本次独立陈述将不能修改。\n\n"
+            "对方不会直接看到你的陈述正文，但 AI 法官会读取双方陈述，"
+            "用于争议地图与后续仲裁。"
+        ),
+        "cancel": "取消",
+        "confirm": "确认提交",
+        "icon": ":material/lock:",
+    },
+    "arbitration_request": {
+        "heading": "确认申请进入最终仲裁？",
+        "body": (
+            "对方还需要确认。\n\n"
+            "在对方确认以前，双方仍可继续调解。\n\n"
+            "如果双方都确认，当前证据会被冻结；最终仲裁期间不能继续发言、"
+            "暂停或请法官介入。"
+        ),
+        "cancel": "取消",
+        "confirm": "确认申请",
+        "icon": ":material/gavel:",
+    },
+    "arbitration_accept": {
+        "heading": "确认进入最终仲裁？",
+        "body": (
+            "确认后，本轮证据将立即冻结。\n\n"
+            "最终仲裁开始后：\n"
+            "- 双方不能继续发送消息\n"
+            "- 不能再请法官介入\n"
+            "- 不能暂停或恢复\n"
+            "- AI 将基于当前冻结材料完成双向复核"
+        ),
+        "cancel": "返回",
+        "confirm": "确认并冻结证据",
+        "icon": ":material/lock:",
+    },
+    "arbitration_decline": {
+        "heading": "确认继续调解？",
+        "body": (
+            "这将拒绝对方当前的最终仲裁申请。\n\n"
+            "案件会返回共享调解状态，双方可以继续沟通。"
+        ),
+        "cancel": "取消",
+        "confirm": "确认继续调解",
+        "icon": ":material/forum:",
+    },
+    "pause": {
+        "heading": "确认暂停当前调解？",
+        "body": (
+            "暂停后，当前共享调解将暂时停止。\n\n"
+            "双方不能继续发送普通调解消息，直到调解被恢复。\n\n"
+            "按照当前规则，只有请求暂停的一方可以恢复调解。"
+        ),
+        "cancel": "取消",
+        "confirm": "确认暂停",
+        "icon": ":material/pause:",
+    },
+    "resume": {
+        "heading": "确认恢复调解？",
+        "body": "恢复后，双方可以继续发送调解消息并继续当前案件。",
+        "cancel": "取消",
+        "confirm": "确认恢复",
+        "icon": ":material/play_arrow:",
+    },
+    "judge_intervention": {
+        "heading": "确认请 AI 法官介入？",
+        "body": (
+            "AI 法官会读取当前共享调解上下文，生成一条中立调解意见，"
+            "并将其加入双方可见的共享记录。\n\n"
+            "该操作会生成新的 AI 调解内容。"
+        ),
+        "cancel": "取消",
+        "confirm": "确认介入",
+        "icon": ":material/gavel:",
+    },
+}
+
+
+def queue_confirmation(action, case_id, role, payload=None):
+    if action not in CONFIRMATION_COPY:
+        raise ValueError("无效的确认操作。")
+    st.session_state["_pending_confirmation"] = {
+        "action": action,
+        "case_id": case_id,
+        "role": role,
+        "payload": payload or {},
+    }
+
+
+def clear_pending_confirmation():
+    st.session_state.pop("_pending_confirmation", None)
+
+
+def build_dispute_map_prompt(statements):
+    return f"""以下是两份独立陈述。
+
+===== A =====
+{statements['A']}
+
+===== B =====
+{statements['B']}
+
+{DISPUTE_MAP_PROMPT}
+"""
+
+
+def run_reserved_dispute_map(case_id, reservation_id):
+    statements = database.get_statements_for_llm(case_id)
+    with st.spinner("AI 法官正在整理双方事实、分歧和待确认事项…"):
+        result = ask(
+            DISPUTE_MAP_PROMPT,
+            build_dispute_map_prompt(statements),
+            max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
+        )
+    database.complete_artifact(
+        case_id,
+        reservation_id,
+        "DISPUTE_MAP",
+        result.content,
+    )
+
+
+def mark_dispute_map_failed(case_id, reservation_id):
+    try:
+        database.fail_artifact(case_id, reservation_id, "DISPUTE_MAP")
+    except DatabaseError:
+        # Keep the unfinished reservation. The stale-reservation guard prevents storms.
+        pass
+
+
+def finish_dispute_map_generation(case_id, reservation_id):
+    try:
+        run_reserved_dispute_map(case_id, reservation_id)
+    except LLMError as error:
+        mark_dispute_map_failed(case_id, reservation_id)
+        show_llm_error(error)
+        st.warning(
+            "独立陈述已经成功冻结，争议地图尚未生成。请稍后重新尝试。"
+        )
+        return False
+    except DatabaseError as error:
+        mark_dispute_map_failed(case_id, reservation_id)
+        show_database_error(error)
+        return False
+    return True
+
+
+def render_automatic_dispute_map(case_id, current_case, submitted):
+    if not (submitted["A"] and submitted["B"]):
+        return
+    if current_case["status"] != "READY_FOR_MAP":
+        return
+
+    st.success("双方独立陈述已提交并冻结。", icon=":material/check_circle:")
+    try:
+        dispute = database.get_artifact(case_id, "DISPUTE_MAP")
+    except DatabaseError as error:
+        show_database_error(error)
+        return
+
+    if dispute and dispute["content"]:
+        return
+    if dispute and dispute.get("generation_failed_at"):
+        st.warning(
+            "AI 法官暂时未能完成争议地图整理。独立陈述仍保持冻结。"
+        )
+        if st.button(
+            "重新尝试整理争议地图",
+            icon=":material/refresh:",
+            key=f"retry_dispute_map_{case_id}",
+        ):
+            try:
+                reservation_id = database.retry_failed_artifact(
+                    case_id,
+                    "DISPUTE_MAP",
+                )
+            except DatabaseError as error:
+                show_database_error(error)
+                return
+            if reservation_id is None:
+                st.info("另一请求已经开始重试，请稍后查看。")
+                return
+            if finish_dispute_map_generation(case_id, reservation_id):
+                st.rerun()
+        return
+    if dispute:
+        st.info(
+            "AI 法官正在整理双方事实、分歧与待确认事项……",
+            icon=":material/hourglass_top:",
+        )
+        return
+    if not llm_available():
+        st.error("AI 法官尚未由网站管理员配置，争议地图暂时无法整理。")
+        return
+
+    try:
+        reservation_id = database.claim_artifact(case_id, "DISPUTE_MAP")
+    except DatabaseError as error:
+        show_database_error(error)
+        return
+    if reservation_id is None:
+        st.info(
+            "AI 法官正在整理双方事实、分歧与待确认事项……",
+            icon=":material/hourglass_top:",
+        )
+        return
+    if finish_dispute_map_generation(case_id, reservation_id):
+        st.rerun()
+
+
+def run_judge_intervention(case_id):
+    database.ensure_judge_intervention_allowed(case_id)
+    statements = database.get_statements_for_llm(case_id)
+    dispute = database.get_artifact(case_id, "DISPUTE_MAP")
+    if not dispute or not dispute["content"]:
+        raise CaseStateError("争议地图尚未完成。")
+    history = "\n\n".join(
+        f"{message['sender']}: {message['content']}"
+        for message in database.get_messages(case_id)
+    ) or "（目前尚无共享消息）"
+    prompt = f"""===== A 独立陈述 =====
+{statements['A']}
+
+===== B 独立陈述 =====
+{statements['B']}
+
+===== 争议地图 =====
+{dispute['content']}
+
+===== 共享调解历史 =====
+{history}
+
+{INTERVENTION_PROMPT}
+"""
+    with st.spinner("法官正在聚焦当前争议…"):
+        result = ask(
+            INTERVENTION_PROMPT,
+            prompt,
+            max_tokens=TASK_MAX_TOKENS["INTERVENTION"],
+        )
+    database.add_message(case_id, "JUDGE", result.content)
 
 
 def release_reservation(case_id, artifact_id, kind):
@@ -143,6 +391,136 @@ def start_or_resume_final_arbitration(case_id):
         show_database_error(error)
         return False
     return True
+
+
+def execute_confirmed_action(pending):
+    action = pending["action"]
+    pending_case_id = pending["case_id"]
+    pending_role = pending["role"]
+    payload = pending.get("payload", {})
+
+    if action == "statement":
+        content = payload.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("待提交的独立陈述无效。")
+        database.save_statement(pending_case_id, pending_role, content)
+    elif action == "arbitration_request":
+        database.request_arbitration(pending_case_id, pending_role)
+    elif action == "arbitration_accept":
+        database.confirm_arbitration(pending_case_id, pending_role)
+        if not start_or_resume_final_arbitration(pending_case_id):
+            st.session_state["_interaction_notice"] = (
+                "证据已冻结；模型流程可在服务恢复后从同一 Snapshot 继续。"
+            )
+    elif action == "arbitration_decline":
+        database.cancel_arbitration_request(pending_case_id, pending_role)
+    elif action == "pause":
+        if not database.pause_case(pending_case_id, pending_role):
+            st.session_state["_interaction_notice"] = "案件状态已经变化。"
+    elif action == "resume":
+        if not database.resume_case(pending_case_id, pending_role):
+            st.session_state["_interaction_notice"] = "案件状态已经变化。"
+    elif action == "judge_intervention":
+        run_judge_intervention(pending_case_id)
+    else:
+        raise ValueError("无效的确认操作。")
+
+
+@st.dialog(
+    "确认操作",
+    dismissible=False,
+    icon=":material/warning:",
+)
+def confirmation_dialog(pending):
+    copy = CONFIRMATION_COPY[pending["action"]]
+    st.markdown(f"### {copy['heading']}")
+    st.markdown(copy["body"])
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        cancel = st.button(
+            copy["cancel"],
+            key=f"cancel_{pending['action']}",
+        )
+        confirm = st.button(
+            copy["confirm"],
+            type="primary",
+            icon=copy["icon"],
+            key=f"confirm_{pending['action']}",
+        )
+    if cancel:
+        clear_pending_confirmation()
+        st.rerun()
+    if not confirm:
+        return
+
+    try:
+        execute_confirmed_action(pending)
+    except StatementAlreadySubmitted:
+        clear_pending_confirmation()
+        st.session_state["_interaction_notice"] = "独立陈述已经提交并冻结。"
+        st.rerun()
+    except CaseStateError as error:
+        st.warning(str(error))
+    except DatabaseError as error:
+        show_database_error(error)
+    except LLMError as error:
+        show_llm_error(error)
+    else:
+        clear_pending_confirmation()
+        st.rerun()
+
+
+def render_pending_confirmation(case_id, role):
+    pending = st.session_state.get("_pending_confirmation")
+    if not pending:
+        return False
+    if (
+        pending.get("action") not in CONFIRMATION_COPY
+        or pending.get("case_id") != case_id
+        or pending.get("role") != role
+    ):
+        clear_pending_confirmation()
+        return False
+    confirmation_dialog(pending)
+    return True
+
+
+@st.dialog(
+    "案件进展",
+    dismissible=False,
+    icon=":material/notifications:",
+)
+def notification_dialog(notification, case_id, role):
+    actor = notification["actor_role"]
+    if notification["event_type"] == "ARBITRATION_ACCEPTED":
+        st.markdown(f"### {actor} 已同意进入最终仲裁")
+        st.markdown("当前证据已冻结。\n\nAI 法官正在进行双向复核。")
+    elif notification["event_type"] == "ARBITRATION_DECLINED":
+        st.markdown(f"### {actor} 选择继续调解")
+        st.markdown(
+            "本次最终仲裁申请已取消。\n\n"
+            "你们可以继续在共享调解室沟通。"
+        )
+    else:
+        st.error("收到无法识别的案件通知。")
+        return
+
+    if st.button(
+        "知道了",
+        type="primary",
+        icon=":material/check:",
+        width="stretch",
+        key=f"ack_notification_{notification['id']}",
+    ):
+        try:
+            database.mark_notification_read(
+                case_id,
+                notification["id"],
+                role,
+            )
+        except DatabaseError as error:
+            show_database_error(error)
+        else:
+            st.rerun()
 
 
 def ask(
@@ -311,6 +689,8 @@ def clear_dev_case_state():
         "dev_role_selector",
         "dev_mock_calls",
         "dev_failure_state",
+        "_pending_confirmation",
+        "_interaction_notice",
     ):
         st.session_state.pop(key, None)
     for key in tuple(st.session_state):
@@ -773,6 +1153,27 @@ if not case:
 
 other = "B" if role == "A" else "A"
 st.subheader(case["title"])
+if interaction_notice := st.session_state.pop("_interaction_notice", None):
+    st.warning(interaction_notice)
+
+render_pending_confirmation(case_id, role)
+
+
+@st.fragment(run_every=AUTO_REFRESH_INTERVAL)
+@observe_fragment("case_notifications")
+def live_case_notifications():
+    if st.session_state.get("_pending_confirmation"):
+        return
+    try:
+        unread = database.get_unread_notifications(case_id, role)
+    except DatabaseError as error:
+        show_database_error(error)
+        return
+    if unread:
+        notification_dialog(unread[0], case_id, role)
+
+
+live_case_notifications()
 
 
 @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
@@ -809,6 +1210,7 @@ def live_case_overview():
         )
     else:
         st.caption("页面每 2 秒同步案件状态；对方的独立陈述正文不会显示。")
+    render_automatic_dispute_map(case_id, current_case, submitted)
 
 
 live_case_overview()
@@ -885,16 +1287,13 @@ if tabs[0].open:
                     )
                 else:
                     content = build_statement_content(role, cleaned)
-                    try:
-                        database.save_statement(case_id, role, content)
-                    except StatementAlreadySubmitted:
-                        st.warning("你的独立陈述已经提交并冻结。")
-                        st.rerun()
-                    except DatabaseError as error:
-                        show_database_error(error)
-                    else:
-                        st.success("已提交并冻结。")
-                        st.rerun()
+                    queue_confirmation(
+                        "statement",
+                        case_id,
+                        role,
+                        {"content": content},
+                    )
+                    st.rerun()
 
         st.info(
             f"你只能看到自己的陈述正文。页面顶部会同步 {other} 是否已经提交。",
@@ -914,72 +1313,20 @@ if tabs[1].open:
 
         if dispute and dispute["content"]:
             st.markdown(dispute["content"])
+        elif dispute and dispute.get("generation_failed_at"):
+            st.warning(
+                "争议地图整理失败，但双方独立陈述已经安全冻结。"
+                "请使用页面上方的“重新尝试整理争议地图”。"
+            )
         elif dispute:
-            st.info("争议地图正在生成，请稍后刷新。", icon=":material/hourglass_top:")
+            st.info(
+                "AI 法官正在整理双方事实、分歧与待确认事项……",
+                icon=":material/hourglass_top:",
+            )
         elif not (submission_status["A"] and submission_status["B"]):
-            st.info(f"等待 {other} 完成独立陈述。双方都提交后才能生成争议地图。")
+            st.info(f"等待 {other} 完成独立陈述。双方都提交后系统会自动整理争议地图。")
         else:
-            st.warning("双方都已提交。现在可以让 AI 法官整理事实与争议，但暂时不判输赢。")
-            if st.button(
-                "生成争议地图",
-                type="primary",
-                icon=":material/account_tree:",
-                width="stretch",
-            ):
-                if not llm_available():
-                    st.error("AI 法官尚未由网站管理员配置。")
-                else:
-                    try:
-                        reservation_id = database.claim_artifact(
-                            case_id,
-                            "DISPUTE_MAP",
-                        )
-                    except DatabaseError as error:
-                        show_database_error(error)
-                    else:
-                        if reservation_id is None:
-                            st.info("争议地图已存在或正在由另一请求生成，请刷新查看。")
-                        else:
-                            try:
-                                statements = database.get_statements_for_llm(case_id)
-                                prompt = f"""以下是两份独立陈述。
-
-===== A =====
-{statements['A']}
-
-===== B =====
-{statements['B']}
-
-{DISPUTE_MAP_PROMPT}
-"""
-                                with st.spinner("正在整理争议地图…"):
-                                    result = ask(
-                                        DISPUTE_MAP_PROMPT,
-                                        prompt,
-                                        max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
-                                    )
-                                database.complete_artifact(
-                                    case_id,
-                                    reservation_id,
-                                    "DISPUTE_MAP",
-                                    result.content,
-                                )
-                            except LLMError as error:
-                                release_reservation(
-                                    case_id,
-                                    reservation_id,
-                                    "DISPUTE_MAP",
-                                )
-                                show_llm_error(error)
-                            except DatabaseError as error:
-                                release_reservation(
-                                    case_id,
-                                    reservation_id,
-                                    "DISPUTE_MAP",
-                                )
-                                show_database_error(error)
-                            else:
-                                st.rerun()
+            st.info("双方独立陈述已提交，系统将自动开始整理争议地图。")
 
 if tabs[2].open:
     with tabs[2]:
@@ -1050,14 +1397,8 @@ if tabs[2].open:
                         icon=":material/play_arrow:",
                         width="stretch",
                     ):
-                        try:
-                            resumed = database.resume_case(case_id, role)
-                        except DatabaseError as error:
-                            show_database_error(error)
-                        else:
-                            if not resumed:
-                                st.info("案件状态已经变化，请稍后查看。")
-                            st.rerun(scope="fragment")
+                        queue_confirmation("resume", case_id, role)
+                        st.rerun()
                 else:
                     st.caption(f"只有请求暂停的 {paused_by} 可以恢复调解。")
             elif pending:
@@ -1071,14 +1412,8 @@ if tabs[2].open:
                     "请求暂停",
                     icon=":material/pause:",
                 ):
-                    try:
-                        paused_now = database.pause_case(case_id, role)
-                    except DatabaseError as error:
-                        show_database_error(error)
-                    else:
-                        if not paused_now:
-                            st.info("案件状态已经变化，请稍后查看。")
-                        st.rerun(scope="fragment")
+                    queue_confirmation("pause", case_id, role)
+                    st.rerun()
 
             for message in messages:
                 if message["sender"] in {"JUDGE", "SYSTEM"}:
@@ -1114,42 +1449,8 @@ if tabs[2].open:
                     icon=":material/gavel:",
                     disabled=not llm_available(),
                 ):
-                    try:
-                        database.ensure_judge_intervention_allowed(case_id)
-                        statements = database.get_statements_for_llm(case_id)
-                        history = "\n\n".join(
-                            f"{message['sender']}: {message['content']}"
-                            for message in database.get_messages(case_id)
-                        ) or "（目前尚无共享消息）"
-                        prompt = f"""===== A 独立陈述 =====
-{statements['A']}
-
-===== B 独立陈述 =====
-{statements['B']}
-
-===== 争议地图 =====
-{dispute['content']}
-
-===== 共享调解历史 =====
-{history}
-
-{INTERVENTION_PROMPT}
-"""
-                        with st.spinner("法官正在聚焦当前争议…"):
-                            result = ask(
-                                INTERVENTION_PROMPT,
-                                prompt,
-                                max_tokens=TASK_MAX_TOKENS["INTERVENTION"],
-                            )
-                        database.add_message(case_id, "JUDGE", result.content)
-                    except CaseStateError as error:
-                        st.warning(str(error))
-                    except LLMError as error:
-                        show_llm_error(error)
-                    except DatabaseError as error:
-                        show_database_error(error)
-                    else:
-                        st.rerun(scope="fragment")
+                    queue_confirmation("judge_intervention", case_id, role)
+                    st.rerun()
 
         shared_mediation_room()
 
@@ -1256,24 +1557,19 @@ if tabs[3].open:
                     if not llm_available():
                         st.caption("AI 法官尚未配置，暂时不能冻结并启动最终仲裁。")
                     if continue_mediation:
-                        try:
-                            database.cancel_arbitration_request(case_id, role)
-                        except DatabaseError as error:
-                            show_database_error(error)
-                        else:
-                            st.rerun()
+                        queue_confirmation(
+                            "arbitration_decline",
+                            case_id,
+                            role,
+                        )
+                        st.rerun()
                     if confirm_arbitration:
-                        try:
-                            database.confirm_arbitration(case_id, role)
-                        except DatabaseError as error:
-                            show_database_error(error)
-                        else:
-                            if start_or_resume_final_arbitration(case_id):
-                                st.rerun()
-                            else:
-                                st.warning(
-                                    "证据已冻结。模型流程可在服务恢复后从同一 Snapshot 继续。"
-                                )
+                        queue_confirmation(
+                            "arbitration_accept",
+                            case_id,
+                            role,
+                        )
+                        st.rerun()
             elif status == "ARBITRATING":
                 st.warning(
                     "🔒 本轮证据已冻结\n\n"
@@ -1356,12 +1652,12 @@ if tabs[3].open:
                     icon=":material/gavel:",
                     width="stretch",
                 ):
-                    try:
-                        database.request_arbitration(case_id, role)
-                    except DatabaseError as error:
-                        show_database_error(error)
-                    else:
-                        st.rerun()
+                    queue_confirmation(
+                        "arbitration_request",
+                        case_id,
+                        role,
+                    )
+                    st.rerun()
             else:
                 st.info("当前案件尚未进入可以申请最终仲裁的阶段。")
 

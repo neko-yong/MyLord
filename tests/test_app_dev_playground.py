@@ -6,6 +6,11 @@ from streamlit.testing.v1 import AppTest
 
 from tests.test_dev_tools import MemoryDatabase
 from tests.test_app_arbitration_ui import select_tab
+from tests.test_app_statement_validation import fill_valid_required_fields
+
+
+def inline_dialog(*_args, **_kwargs):
+    return lambda function: function
 
 
 class AppMemoryDatabase(MemoryDatabase):
@@ -61,6 +66,7 @@ def app_environment(database=None, dev_mode=True):
         ),
         database_patch,
         patch("llm.call_llm", side_effect=AssertionError("Real LLM called")),
+        patch("streamlit.dialog", new=inline_dialog),
     )
 
 
@@ -101,6 +107,7 @@ class DeveloperPlaygroundAppTests(unittest.TestCase):
             patches[1],
             patches[2] as postgres,
             patches[3] as real_llm,
+            patches[4],
         ):
             app = AppTest.from_file(app_path).run(timeout=15)
             text = all_visible_text(app)
@@ -150,7 +157,13 @@ class DeveloperPlaygroundAppTests(unittest.TestCase):
 
     def test_dev_fast_full_workflow_and_reset_use_no_network_backend(self):
         app_path, patches = app_environment(dev_mode=True)
-        with patches[0], patches[1], patches[2] as postgres, patches[3] as real_llm:
+        with (
+            patches[0],
+            patches[1],
+            patches[2] as postgres,
+            patches[3] as real_llm,
+            patches[4],
+        ):
             app = AppTest.from_file(app_path).run(timeout=15)
             find(app.button, "创建测试案件").click()
             app.run(timeout=15)
@@ -159,10 +172,15 @@ class DeveloperPlaygroundAppTests(unittest.TestCase):
             select_tab(app, "④ 最终仲裁")
             find(app.button, "申请进入最终仲裁").click()
             select_tab(app, "④ 最终仲裁")
+            find(app.button, "确认申请").click()
+            app.run(timeout=15)
+            select_tab(app, "④ 最终仲裁")
             find(app.button, "取消最终仲裁申请").click()
             select_tab(app, "④ 最终仲裁")
             find(app.button, "申请进入最终仲裁").click()
             select_tab(app, "④ 最终仲裁")
+            find(app.button, "确认申请").click()
+            app.run(timeout=15)
 
             find(app.segmented_control, "查看身份").set_value("B")
             app.run(timeout=15)
@@ -170,6 +188,8 @@ class DeveloperPlaygroundAppTests(unittest.TestCase):
             select_tab(app, "④ 最终仲裁")
             find(app.button, "同意进入最终仲裁").click()
             select_tab(app, "④ 最终仲裁")
+            find(app.button, "确认并冻结证据").click()
+            app.run(timeout=15)
 
             store = app.session_state["_dev_local_store"]
             self.assertEqual(store["cases"][dev_case.case_id]["status"], "CLOSED")
@@ -192,11 +212,190 @@ class DeveloperPlaygroundAppTests(unittest.TestCase):
             self.assertEqual(app.session_state["_dev_local_store"]["cases"], {})
             self.assertNotIn("dev_case", app.session_state)
 
+    def test_mediation_controls_require_confirmation_but_chat_does_not(self):
+        app_path, patches = app_environment(dev_mode=True)
+        with (
+            patches[0],
+            patches[1],
+            patches[2] as postgres,
+            patches[3] as real_llm,
+            patches[4],
+        ):
+            app = AppTest.from_file(app_path).run(timeout=15)
+            find(app.button, "创建测试案件").click()
+            app.run(timeout=15)
+            case_id = app.session_state["dev_case"].case_id
+            store = app.session_state["_dev_local_store"]
+
+            select_tab(app, "③ 调解室")
+            self.assertEqual(len(app.chat_input), 1)
+            self.assertNotIn("_pending_confirmation", app.session_state)
+
+            find(app.button, "请求暂停").click()
+            select_tab(app, "③ 调解室")
+            self.assertEqual(store["cases"][case_id]["status"], "MEDIATING")
+            find(app.button, "取消").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][case_id]["status"], "MEDIATING")
+
+            select_tab(app, "③ 调解室")
+            find(app.button, "请求暂停").click()
+            select_tab(app, "③ 调解室")
+            find(app.button, "确认暂停").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][case_id]["status"], "PAUSED")
+
+            select_tab(app, "③ 调解室")
+            find(app.button, "我准备好了，恢复调解").click()
+            select_tab(app, "③ 调解室")
+            find(app.button, "取消").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][case_id]["status"], "PAUSED")
+
+            select_tab(app, "③ 调解室")
+            find(app.button, "我准备好了，恢复调解").click()
+            select_tab(app, "③ 调解室")
+            find(app.button, "确认恢复").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][case_id]["status"], "MEDIATING")
+
+            select_tab(app, "③ 调解室")
+            before_judge = len(store["messages"][case_id])
+            find(app.button, "请法官介入").click()
+            select_tab(app, "③ 调解室")
+            self.assertEqual(
+                app.session_state["dev_mock_calls"].get("JUDGE_INTERVENTION", 0),
+                0,
+            )
+            find(app.button, "取消").click()
+            app.run(timeout=15)
+            self.assertEqual(len(store["messages"][case_id]), before_judge)
+
+            select_tab(app, "③ 调解室")
+            find(app.button, "请法官介入").click()
+            select_tab(app, "③ 调解室")
+            find(app.button, "确认介入").click()
+            app.run(timeout=15)
+            self.assertEqual(
+                app.session_state["dev_mock_calls"]["JUDGE_INTERVENTION"],
+                1,
+            )
+            self.assertEqual(len(store["messages"][case_id]), before_judge + 1)
+            self.assertEqual(postgres.mock_calls, [])
+            self.assertEqual(real_llm.mock_calls, [])
+
+    def test_second_statement_auto_generates_map_and_failure_retry_recovers(self):
+        app_path, patches = app_environment(dev_mode=True)
+        with (
+            patches[0],
+            patches[1],
+            patches[2] as postgres,
+            patches[3] as real_llm,
+            patches[4],
+        ):
+            app = AppTest.from_file(app_path).run(timeout=15)
+            find(app.selectbox, "Scenario").set_value("EMPTY")
+            find(app.selectbox, "模拟失败阶段").set_value("DISPUTE_MAP")
+            app.run(timeout=15)
+            find(app.button, "创建测试案件").click()
+            app.run(timeout=15)
+            case_id = app.session_state["dev_case"].case_id
+            store = app.session_state["_dev_local_store"]
+
+            fill_valid_required_fields(app)
+            find(app.button, "提交并冻结").click()
+            app.run(timeout=15)
+            self.assertEqual(store["statements"], {})
+            find(app.button, "确认提交").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][case_id]["status"], "COLLECTING")
+            self.assertEqual(app.session_state["dev_mock_calls"], {})
+
+            find(app.segmented_control, "查看身份").set_value("B")
+            app.run(timeout=15)
+            fill_valid_required_fields(app)
+            find(app.button, "提交并冻结").click()
+            app.run(timeout=15)
+            find(app.button, "确认提交").click()
+            app.run(timeout=15)
+
+            self.assertEqual(store["cases"][case_id]["status"], "READY_FOR_MAP")
+            artifact = store["artifacts"][(case_id, "DISPUTE_MAP")]
+            self.assertIsNotNone(artifact["generation_failed_at"])
+            self.assertEqual(app.session_state["dev_mock_calls"]["DISPUTE_MAP"], 1)
+            app.run(timeout=15)
+            find(app.button, "重新尝试整理争议地图").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][case_id]["status"], "MAP_READY")
+            self.assertEqual(app.session_state["dev_mock_calls"]["DISPUTE_MAP"], 2)
+            self.assertEqual(postgres.mock_calls, [])
+            self.assertEqual(real_llm.mock_calls, [])
+
+    def test_fast_local_decline_and_accept_notifications_are_acknowledged_once(self):
+        app_path, patches = app_environment(dev_mode=True)
+        with (
+            patches[0],
+            patches[1],
+            patches[2] as postgres,
+            patches[3] as real_llm,
+            patches[4],
+        ):
+            app = AppTest.from_file(app_path).run(timeout=15)
+            find(app.selectbox, "Scenario").set_value("ARBITRATION_PENDING_A")
+            app.run(timeout=15)
+            find(app.button, "创建测试案件").click()
+            app.run(timeout=15)
+            first_case = app.session_state["dev_case"].case_id
+            store = app.session_state["_dev_local_store"]
+
+            find(app.segmented_control, "查看身份").set_value("B")
+            app.run(timeout=15)
+            select_tab(app, "④ 最终仲裁")
+            find(app.button, "继续调解").click()
+            select_tab(app, "④ 最终仲裁")
+            find(app.button, "确认继续调解").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][first_case]["status"], "MEDIATING")
+
+            find(app.segmented_control, "查看身份").set_value("A")
+            app.run(timeout=15)
+            self.assertIn("B 选择继续调解", all_visible_text(app))
+            unread = [
+                item
+                for item in store["notifications"].values()
+                if item["case_id"] == first_case and item["read_at"] is None
+            ]
+            self.assertEqual(len(unread), 1)
+            find(app.button, "知道了").click()
+            app.run(timeout=15)
+            self.assertNotIn("B 选择继续调解", all_visible_text(app))
+
+            find(app.button, "重新创建相同场景").click()
+            app.run(timeout=15)
+            second_case = app.session_state["dev_case"].case_id
+            find(app.segmented_control, "查看身份").set_value("B")
+            app.run(timeout=15)
+            select_tab(app, "④ 最终仲裁")
+            find(app.button, "同意进入最终仲裁").click()
+            select_tab(app, "④ 最终仲裁")
+            find(app.button, "确认并冻结证据").click()
+            app.run(timeout=15)
+            self.assertEqual(store["cases"][second_case]["status"], "CLOSED")
+
+            find(app.segmented_control, "查看身份").set_value("A")
+            app.run(timeout=15)
+            self.assertIn("B 已同意进入最终仲裁", all_visible_text(app))
+            find(app.button, "知道了").click()
+            app.run(timeout=15)
+            self.assertNotIn("B 已同意进入最终仲裁", all_visible_text(app))
+            self.assertEqual(postgres.mock_calls, [])
+            self.assertEqual(real_llm.mock_calls, [])
+
     def test_production_hides_all_developer_controls(self):
         database = AppMemoryDatabase()
         app_path, patches = app_environment(database, False)
 
-        with patches[0], patches[1], patches[2], patches[3]:
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
             app = AppTest.from_file(app_path).run(timeout=15)
 
         text = all_visible_text(app)
@@ -218,7 +417,7 @@ class DeveloperPlaygroundAppTests(unittest.TestCase):
     def test_switching_database_mode_clears_active_case_reference(self):
         postgres_database = AppMemoryDatabase()
         app_path, patches = app_environment(postgres_database, True)
-        with patches[0], patches[1], patches[2] as postgres, patches[3]:
+        with patches[0], patches[1], patches[2] as postgres, patches[3], patches[4]:
             app = AppTest.from_file(app_path).run(timeout=15)
             find(app.button, "创建测试案件").click()
             app.run(timeout=15)

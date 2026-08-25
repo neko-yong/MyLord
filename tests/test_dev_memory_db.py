@@ -329,7 +329,88 @@ class DevMemoryDatabaseTests(unittest.TestCase):
         self.assertEqual(self.store["statements"], {})
         self.assertEqual(self.store["messages"], {})
         self.assertEqual(self.store["artifacts"], {})
+        self.assertEqual(self.store["notifications"], {})
         self.assertEqual(self.store["message_sequence"], 0)
+
+    def test_dispute_map_failure_requires_one_explicit_retry(self):
+        dev_case = seed_dev_case(
+            LOCAL_SETTINGS,
+            self.database,
+            "weekend_plan",
+            "STATEMENTS_SUBMITTED",
+        )
+        case_id = dev_case.case_id
+        reservation = self.database.claim_artifact(case_id, "DISPUTE_MAP")
+        self.assertIsNotNone(reservation)
+        self.assertTrue(
+            self.database.fail_artifact(
+                case_id,
+                reservation,
+                "DISPUTE_MAP",
+            )
+        )
+        self.assertIsNone(self.database.claim_artifact(case_id, "DISPUTE_MAP"))
+
+        retry = self.database.retry_failed_artifact(case_id, "DISPUTE_MAP")
+        self.assertEqual(retry, reservation)
+        self.assertIsNone(
+            self.database.retry_failed_artifact(case_id, "DISPUTE_MAP")
+        )
+        self.database.complete_artifact(
+            case_id,
+            retry,
+            "DISPUTE_MAP",
+            "Recovered map",
+        )
+        self.assertEqual(self.database.get_case(case_id)["status"], "MAP_READY")
+        self.assertEqual(
+            self.database.get_artifact(case_id, "DISPUTE_MAP")["content"],
+            "Recovered map",
+        )
+
+    def test_arbitration_notifications_are_recipient_scoped_and_acknowledged(self):
+        dev_case = seed_dev_case(
+            LOCAL_SETTINGS,
+            self.database,
+            "weekend_plan",
+            "MEDIATING",
+        )
+        case_id = dev_case.case_id
+
+        self.database.request_arbitration(case_id, "A")
+        self.database.cancel_arbitration_request(case_id, "A")
+        self.assertEqual(self.database.get_unread_notifications(case_id, "A"), [])
+
+        self.database.request_arbitration(case_id, "A")
+        self.database.cancel_arbitration_request(case_id, "B")
+        declined = self.database.get_unread_notifications(case_id, "A")
+        self.assertEqual(len(declined), 1)
+        self.assertEqual(declined[0]["event_type"], "ARBITRATION_DECLINED")
+        self.assertEqual(declined[0]["actor_role"], "B")
+        self.assertEqual(self.database.get_unread_notifications(case_id, "B"), [])
+        self.assertFalse(
+            self.database.mark_notification_read(
+                case_id,
+                declined[0]["id"],
+                "B",
+            )
+        )
+        self.assertTrue(
+            self.database.mark_notification_read(
+                case_id,
+                declined[0]["id"],
+                "A",
+            )
+        )
+        self.assertEqual(self.database.get_unread_notifications(case_id, "A"), [])
+
+        self.database.request_arbitration(case_id, "A")
+        self.database.confirm_arbitration(case_id, "B")
+        self.database.confirm_arbitration(case_id, "B")
+        accepted = self.database.get_unread_notifications(case_id, "A")
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["event_type"], "ARBITRATION_ACCEPTED")
+        self.assertEqual(accepted[0]["actor_role"], "B")
 
 
 if __name__ == "__main__":

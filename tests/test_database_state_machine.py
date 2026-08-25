@@ -150,11 +150,20 @@ class ArbitrationStateMachineTests(unittest.TestCase):
             ),
             Result(row={"count": 1}),
             Result(row={"status": "MEDIATING"}),
+            Result(
+                row={
+                    "id": 1,
+                    "event_type": "ARBITRATION_DECLINED",
+                    "recipient_role": "A",
+                    "actor_role": "B",
+                }
+            ),
         )
 
         result = database.cancel_arbitration_request("CASE-TEST", "B")
 
         self.assertEqual(result["status"], "MEDIATING")
+        self.assertIn("INSERT INTO case_notifications", _connection.calls[-1][0])
 
     def test_pending_message_is_allowed_without_cancelling_request(self):
         database, connection = database_with(

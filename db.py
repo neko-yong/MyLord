@@ -41,6 +41,10 @@ ARTIFACT_KINDS = (
 )
 MESSAGE_SENDERS = {"A", "B", "JUDGE", "SYSTEM"}
 ROLES = {"A", "B"}
+NOTIFICATION_EVENT_TYPES = {
+    "ARBITRATION_ACCEPTED",
+    "ARBITRATION_DECLINED",
+}
 MESSAGE_ALLOWED_STATUSES = {"MAP_READY", "MEDIATING", "ARBITRATION_PENDING"}
 ARBITRATION_REQUEST_ALLOWED_STATUSES = {"MAP_READY", "MEDIATING"}
 
@@ -148,6 +152,7 @@ SCHEMA_STATEMENTS = (
         )),
         content TEXT NOT NULL,
         evidence_hash TEXT,
+        generation_failed_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE(case_id, kind)
     )
@@ -155,6 +160,10 @@ SCHEMA_STATEMENTS = (
     """
     ALTER TABLE artifacts
         ADD COLUMN IF NOT EXISTS evidence_hash TEXT
+    """,
+    """
+    ALTER TABLE artifacts
+        ADD COLUMN IF NOT EXISTS generation_failed_at TIMESTAMPTZ
     """,
     """
     DO $$
@@ -186,8 +195,26 @@ SCHEMA_STATEMENTS = (
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS case_notifications (
+        id BIGSERIAL PRIMARY KEY,
+        case_id TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+        recipient_role TEXT NOT NULL CHECK (recipient_role IN ('A', 'B')),
+        event_type TEXT NOT NULL CHECK (event_type IN (
+            'ARBITRATION_ACCEPTED', 'ARBITRATION_DECLINED'
+        )),
+        actor_role TEXT NOT NULL CHECK (actor_role IN ('A', 'B')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        read_at TIMESTAMPTZ
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_messages_case_id ON messages(case_id, id)",
     "CREATE INDEX IF NOT EXISTS idx_statements_case_id ON statements(case_id)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_case_notifications_unread
+    ON case_notifications(case_id, recipient_role, created_at, id)
+    WHERE read_at IS NULL
+    """,
 )
 
 
@@ -207,6 +234,13 @@ def _private_token(role):
 def _validate_role(role):
     if role not in ROLES:
         raise ValueError("无效的案件身份。")
+
+
+def _validate_notification(event_type, recipient_role, actor_role):
+    if event_type not in NOTIFICATION_EVENT_TYPES:
+        raise ValueError("无效的通知类型。")
+    _validate_role(recipient_role)
+    _validate_role(actor_role)
 
 
 def _validate_evidence_hash(value):
@@ -553,6 +587,93 @@ class Database:
         status = self.get_submission_status(case_id)
         return status["A"] and status["B"]
 
+    @staticmethod
+    def _insert_notification(
+        connection,
+        case_id,
+        recipient_role,
+        event_type,
+        actor_role,
+    ):
+        return connection.execute(
+            """
+            INSERT INTO case_notifications(
+                case_id,
+                recipient_role,
+                event_type,
+                actor_role,
+                created_at
+            )
+            VALUES (%s, %s, %s, %s, NOW())
+            RETURNING
+                id,
+                case_id,
+                recipient_role,
+                event_type,
+                actor_role,
+                created_at,
+                read_at
+            """,
+            (case_id, recipient_role, event_type, actor_role),
+        ).fetchone()
+
+    def create_notification(
+        self,
+        case_id,
+        recipient_role,
+        event_type,
+        actor_role,
+    ):
+        _validate_notification(event_type, recipient_role, actor_role)
+        with self._connection() as connection:
+            return self._insert_notification(
+                connection,
+                case_id,
+                recipient_role,
+                event_type,
+                actor_role,
+            )
+
+    def get_unread_notifications(self, case_id, recipient_role):
+        _validate_role(recipient_role)
+        return self._read_query(
+            """
+            SELECT
+                id,
+                case_id,
+                recipient_role,
+                event_type,
+                actor_role,
+                created_at,
+                read_at
+            FROM case_notifications
+            WHERE
+                case_id = %s
+                AND recipient_role = %s
+                AND read_at IS NULL
+            ORDER BY created_at ASC, id ASC
+            """,
+            (case_id, recipient_role),
+            fetch_all=True,
+        )
+
+    def mark_notification_read(self, case_id, notification_id, recipient_role):
+        _validate_role(recipient_role)
+        with self._connection() as connection:
+            result = connection.execute(
+                """
+                UPDATE case_notifications
+                SET read_at = NOW()
+                WHERE
+                    id = %s
+                    AND case_id = %s
+                    AND recipient_role = %s
+                    AND read_at IS NULL
+                """,
+                (notification_id, case_id, recipient_role),
+            )
+        return result.rowcount == 1
+
     def request_arbitration(self, case_id, role):
         _validate_role(role)
         with self._connection() as connection:
@@ -616,7 +737,7 @@ class Database:
                 (case_id,),
             ).fetchone()["count"]
             target_status = "MEDIATING" if message_count else "MAP_READY"
-            return connection.execute(
+            result = connection.execute(
                 """
                 UPDATE cases
                 SET
@@ -630,6 +751,16 @@ class Database:
                 """,
                 (target_status, case_id),
             ).fetchone()
+            requester = case["arbitration_requested_by"]
+            if requester in ROLES and role != requester:
+                self._insert_notification(
+                    connection,
+                    case_id,
+                    requester,
+                    "ARBITRATION_DECLINED",
+                    role,
+                )
+            return result
 
     def confirm_arbitration(self, case_id, role):
         _validate_role(role)
@@ -763,12 +894,25 @@ class Database:
                 """,
                 (frozen_at, case_id),
             )
+            self._insert_notification(
+                connection,
+                case_id,
+                requester,
+                "ARBITRATION_ACCEPTED",
+                role,
+            )
             return _evidence_record(artifact)
 
     def get_arbitration_evidence(self, case_id):
         row = self._read_query(
             """
-            SELECT id, case_id, kind, content, evidence_hash, created_at
+            SELECT
+                id,
+                case_id,
+                kind,
+                content,
+                evidence_hash,
+                created_at
             FROM artifacts
             WHERE case_id = %s AND kind = 'ARBITRATION_EVIDENCE'
             """,
@@ -781,7 +925,14 @@ class Database:
             raise ValueError("无效的仲裁产物类型。")
         return self._read_query(
             """
-            SELECT id, case_id, kind, content, evidence_hash, created_at
+            SELECT
+                id,
+                case_id,
+                kind,
+                content,
+                evidence_hash,
+                generation_failed_at,
+                created_at
             FROM artifacts
             WHERE case_id = %s AND kind = %s
             """,
@@ -860,6 +1011,7 @@ class Database:
                 WHERE case_id = %s
                   AND kind = %s
                   AND content = ''
+                  AND generation_failed_at IS NULL
                   AND created_at < NOW() - INTERVAL '15 minutes'
                 """,
                 (case_id, kind),
@@ -867,6 +1019,46 @@ class Database:
             row = connection.execute(
                 statement,
                 (kind, case_id),
+            ).fetchone()
+        return row["id"] if row else None
+
+    def fail_artifact(self, case_id, artifact_id, kind):
+        if kind != "DISPUTE_MAP":
+            raise ValueError("只有争议地图支持生成失败恢复。")
+        with self._connection() as connection:
+            result = connection.execute(
+                """
+                UPDATE artifacts
+                SET generation_failed_at = COALESCE(generation_failed_at, NOW())
+                WHERE
+                    id = %s
+                    AND case_id = %s
+                    AND kind = %s
+                    AND content = ''
+                """,
+                (artifact_id, case_id, kind),
+            )
+        return result.rowcount == 1
+
+    def retry_failed_artifact(self, case_id, kind):
+        if kind != "DISPUTE_MAP":
+            raise ValueError("只有争议地图支持生成失败恢复。")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                UPDATE artifacts AS artifact
+                SET generation_failed_at = NULL, created_at = NOW()
+                FROM cases AS case_record
+                WHERE
+                    artifact.case_id = case_record.case_id
+                    AND artifact.case_id = %s
+                    AND artifact.kind = %s
+                    AND artifact.content = ''
+                    AND artifact.generation_failed_at IS NOT NULL
+                    AND case_record.status = 'READY_FOR_MAP'
+                RETURNING artifact.id
+                """,
+                (case_id, kind),
             ).fetchone()
         return row["id"] if row else None
 
@@ -908,7 +1100,7 @@ class Database:
                 artifact = connection.execute(
                     """
                     UPDATE artifacts
-                    SET content = %s
+                    SET content = %s, generation_failed_at = NULL
                     WHERE id = %s
                       AND case_id = %s
                       AND kind = %s
@@ -921,7 +1113,7 @@ class Database:
                 artifact = connection.execute(
                     """
                     UPDATE artifacts
-                    SET content = %s
+                    SET content = %s, generation_failed_at = NULL
                     WHERE id = %s
                       AND case_id = %s
                       AND kind = %s

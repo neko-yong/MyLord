@@ -9,6 +9,7 @@ from db import (
     CHECKPOINT_ARTIFACT_KINDS,
     MESSAGE_ALLOWED_STATUSES,
     MESSAGE_SENDERS,
+    NOTIFICATION_EVENT_TYPES,
     PUBLIC_ARTIFACT_KINDS,
     ROLES,
     CaseStateError,
@@ -46,10 +47,12 @@ def new_dev_local_store(settings):
         "statements": {},
         "messages": {},
         "artifacts": {},
+        "notifications": {},
         "case_sequence": 0,
         "statement_sequence": 0,
         "message_sequence": 0,
         "artifact_sequence": 0,
+        "notification_sequence": 0,
     }
 
 
@@ -79,6 +82,8 @@ class DevMemoryDatabase:
         require_dev_local(settings, database_mode)
         if not isinstance(store, dict) or store.get("version") != STORE_VERSION:
             raise ValueError("Fast Local store 版本无效，请 Reset Local Playground。")
+        store.setdefault("notifications", {})
+        store.setdefault("notification_sequence", 0)
         self.settings = settings
         self.store = store
         self.database_mode = database_mode
@@ -172,6 +177,11 @@ class DevMemoryDatabase:
             for key, value in self.store["artifacts"].items()
             if key[0] != case_id
         }
+        self.store["notifications"] = {
+            key: value
+            for key, value in self.store["notifications"].items()
+            if value["case_id"] != case_id
+        }
         return True
 
     def authenticate(self, case_id, token):
@@ -259,6 +269,59 @@ class DevMemoryDatabase:
         submitted = self.get_submission_status(case_id)
         return submitted["A"] and submitted["B"]
 
+    def create_notification(
+        self,
+        case_id,
+        recipient_role,
+        event_type,
+        actor_role,
+    ):
+        self._guard()
+        self._case(case_id)
+        _role(recipient_role)
+        _role(actor_role)
+        if event_type not in NOTIFICATION_EVENT_TYPES:
+            raise ValueError("无效的通知类型。")
+        notification_id = self._next("notification_sequence")
+        notification = {
+            "id": notification_id,
+            "case_id": case_id,
+            "recipient_role": recipient_role,
+            "event_type": event_type,
+            "actor_role": actor_role,
+            "created_at": _now(),
+            "read_at": None,
+        }
+        self.store["notifications"][notification_id] = notification
+        return copy.deepcopy(notification)
+
+    def get_unread_notifications(self, case_id, recipient_role):
+        self._guard()
+        _role(recipient_role)
+        notifications = [
+            notification
+            for notification in self.store["notifications"].values()
+            if notification["case_id"] == case_id
+            and notification["recipient_role"] == recipient_role
+            and notification["read_at"] is None
+        ]
+        notifications.sort(key=lambda item: (item["created_at"], item["id"]))
+        return copy.deepcopy(notifications)
+
+    def mark_notification_read(self, case_id, notification_id, recipient_role):
+        self._guard()
+        _role(recipient_role)
+        notification = self.store["notifications"].get(notification_id)
+        if (
+            not notification
+            or notification["case_id"] != case_id
+            or notification["recipient_role"] != recipient_role
+            or notification["read_at"] is not None
+        ):
+            return False
+        notification["read_at"] = _now()
+        return True
+
     def request_arbitration(self, case_id, role):
         self._guard()
         _role(role)
@@ -281,6 +344,7 @@ class DevMemoryDatabase:
         case = self._case(case_id)
         if case["status"] != "ARBITRATION_PENDING":
             raise CaseStateError("当前没有待确认的最终仲裁申请。")
+        requester = case["arbitration_requested_by"]
         case["status"] = (
             "MEDIATING" if self.store["messages"].get(case_id) else "MAP_READY"
         )
@@ -288,6 +352,13 @@ class DevMemoryDatabase:
         case["arbitration_requested_at"] = None
         case["arbitration_started_at"] = None
         self._touch(case)
+        if requester in ROLES and role != requester:
+            self.create_notification(
+                case_id,
+                requester,
+                "ARBITRATION_DECLINED",
+                role,
+            )
         return self.get_case(case_id)
 
     def confirm_arbitration(self, case_id, role):
@@ -344,6 +415,12 @@ class DevMemoryDatabase:
         case["paused_by"] = None
         case["arbitration_started_at"] = frozen_at
         self._touch(case)
+        self.create_notification(
+            case_id,
+            requester,
+            "ARBITRATION_ACCEPTED",
+            role,
+        )
         return self.get_arbitration_evidence(case_id)
 
     def get_arbitration_evidence(self, case_id):
@@ -424,9 +501,39 @@ class DevMemoryDatabase:
             "kind": kind,
             "content": "",
             "evidence_hash": snapshot_hash,
+            "generation_failed_at": None,
             "created_at": _now(),
         }
         return artifact_id
+
+    def fail_artifact(self, case_id, artifact_id, kind):
+        self._guard()
+        if kind != "DISPUTE_MAP":
+            raise ValueError("只有争议地图支持生成失败恢复。")
+        artifact = self.store["artifacts"].get((case_id, kind))
+        if not artifact or artifact["id"] != artifact_id or artifact["content"]:
+            return False
+        artifact["generation_failed_at"] = artifact.get(
+            "generation_failed_at"
+        ) or _now()
+        return True
+
+    def retry_failed_artifact(self, case_id, kind):
+        self._guard()
+        if kind != "DISPUTE_MAP":
+            raise ValueError("只有争议地图支持生成失败恢复。")
+        case = self._case(case_id)
+        artifact = self.store["artifacts"].get((case_id, kind))
+        if (
+            case["status"] != "READY_FOR_MAP"
+            or not artifact
+            or artifact["content"]
+            or artifact.get("generation_failed_at") is None
+        ):
+            return None
+        artifact["generation_failed_at"] = None
+        artifact["created_at"] = _now()
+        return artifact["id"]
 
     def complete_artifact(self, case_id, artifact_id, kind, content):
         self._guard()
@@ -452,6 +559,7 @@ class DevMemoryDatabase:
             if not evidence or artifact["evidence_hash"] != evidence["evidence_hash"]:
                 raise CaseStateError("案件缺少冻结证据。")
         artifact["content"] = content.strip()
+        artifact["generation_failed_at"] = None
         case["status"] = "MAP_READY" if kind == "DISPUTE_MAP" else "CLOSED"
         case["paused_by"] = None
         self._touch(case)

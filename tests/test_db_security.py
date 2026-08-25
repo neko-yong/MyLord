@@ -58,6 +58,16 @@ class DatabaseSecurityTests(unittest.TestCase):
         self.assertNotIn("drop table", schema)
         self.assertNotIn("truncate", schema)
 
+    def test_notification_schema_is_minimal_and_recipient_scoped(self):
+        schema = "\n".join(db.SCHEMA_STATEMENTS).lower()
+
+        self.assertIn("case_notifications", schema)
+        self.assertIn("recipient_role", schema)
+        self.assertIn("actor_role", schema)
+        self.assertIn("event_type", schema)
+        self.assertIn("read_at", schema)
+        self.assertNotIn("notification_payload", schema)
+
     @patch("db.ConnectionPool")
     def test_pool_separates_acquire_and_connect_timeouts(self, pool_class):
         database = db.Database("postgresql://test.invalid/database")

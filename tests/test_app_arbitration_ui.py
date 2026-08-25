@@ -13,6 +13,10 @@ TAB_LABELS = {
 }
 
 
+def inline_dialog(*_args, **_kwargs):
+    return lambda function: function
+
+
 class FakeDatabase:
     def __init__(self, status, requester=None, role="A"):
         self.status = status
@@ -20,6 +24,7 @@ class FakeDatabase:
         self.role = role
         self.confirm_calls = 0
         self.request_calls = 0
+        self.notifications = []
 
     def init_db(self):
         return None
@@ -84,8 +89,19 @@ class FakeDatabase:
         return self.get_case("CASE-UI")
 
     def cancel_arbitration_request(self, _case_id, _role):
+        requester = self.requester
         self.status = "MEDIATING"
         self.requester = None
+        if requester and _role != requester:
+            self.notifications.append(
+                {
+                    "id": len(self.notifications) + 1,
+                    "event_type": "ARBITRATION_DECLINED",
+                    "recipient_role": requester,
+                    "actor_role": _role,
+                    "read_at": None,
+                }
+            )
         return self.get_case("CASE-UI")
 
     def confirm_arbitration(self, _case_id, role):
@@ -93,10 +109,38 @@ class FakeDatabase:
             raise AssertionError("requester must not confirm")
         self.confirm_calls += 1
         self.status = "ARBITRATING"
+        self.notifications.append(
+            {
+                "id": len(self.notifications) + 1,
+                "event_type": "ARBITRATION_ACCEPTED",
+                "recipient_role": self.requester,
+                "actor_role": role,
+                "read_at": None,
+            }
+        )
         return self.get_arbitration_evidence("CASE-UI")
 
     def claim_artifact(self, _case_id, _kind):
         return None
+
+    def get_unread_notifications(self, _case_id, _role):
+        return [
+            notification
+            for notification in self.notifications
+            if notification["recipient_role"] == _role
+            and notification["read_at"] is None
+        ]
+
+    def mark_notification_read(self, _case_id, notification_id, role):
+        for notification in self.notifications:
+            if (
+                notification["id"] == notification_id
+                and notification["recipient_role"] == role
+                and notification["read_at"] is None
+            ):
+                notification["read_at"] = "now"
+                return True
+        return False
 
 
 def select_tab(app, label):
@@ -133,13 +177,14 @@ class ArbitrationUITests(unittest.TestCase):
                 return_value=False,
             ),
             patch("db.Database", return_value=database),
+            patch("streamlit.dialog", new=inline_dialog),
         )
         return app_path, patches
 
     def test_requester_can_request_and_cancel(self):
         database = FakeDatabase("MAP_READY", role="A")
         app_path, patches = self.run_app(database, "A")
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app = AppTest.from_file(app_path)
             app.session_state["auth"] = {"case_id": "CASE-UI", "role": "A"}
             app.run(timeout=15)
@@ -154,6 +199,24 @@ class ArbitrationUITests(unittest.TestCase):
                 if button.label == "申请进入最终仲裁"
             )
             request.click()
+            select_tab(app, "④ 最终仲裁")
+            self.assertEqual(database.request_calls, 0)
+            next(
+                button for button in app.button if button.label == "取消"
+            ).click()
+            app.run(timeout=15)
+            self.assertEqual(database.request_calls, 0)
+            select_tab(app, "④ 最终仲裁")
+            next(
+                button
+                for button in app.button
+                if button.label == "申请进入最终仲裁"
+            ).click()
+            select_tab(app, "④ 最终仲裁")
+            next(
+                button for button in app.button if button.label == "确认申请"
+            ).click()
+            app.run(timeout=15)
             select_tab(app, "④ 最终仲裁")
 
             self.assertEqual(database.request_calls, 1)
@@ -188,7 +251,7 @@ class ArbitrationUITests(unittest.TestCase):
             role="B",
         )
         app_path, patches = self.run_app(database, "B")
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app = AppTest.from_file(app_path)
             app.session_state["auth"] = {"case_id": "CASE-UI", "role": "B"}
             app.run(timeout=15)
@@ -204,6 +267,24 @@ class ArbitrationUITests(unittest.TestCase):
                 button for button in app.button if button.label == "继续调解"
             )
             continue_button.click()
+            select_tab(app, "④ 最终仲裁")
+            self.assertEqual(database.status, "ARBITRATION_PENDING")
+            next(
+                button for button in app.button if button.label == "取消"
+            ).click()
+            app.run(timeout=15)
+            self.assertEqual(database.status, "ARBITRATION_PENDING")
+            select_tab(app, "④ 最终仲裁")
+            next(
+                button for button in app.button if button.label == "继续调解"
+            ).click()
+            select_tab(app, "④ 最终仲裁")
+            next(
+                button
+                for button in app.button
+                if button.label == "确认继续调解"
+            ).click()
+            app.run(timeout=15)
             select_tab(app, "④ 最终仲裁")
 
             self.assertEqual(database.status, "MEDIATING")
@@ -221,7 +302,7 @@ class ArbitrationUITests(unittest.TestCase):
             role="B",
         )
         app_path, patches = self.run_app(database, "B")
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app = AppTest.from_file(app_path)
             app.session_state["auth"] = {"case_id": "CASE-UI", "role": "B"}
             app.run(timeout=15)
@@ -236,6 +317,27 @@ class ArbitrationUITests(unittest.TestCase):
                 if button.label == "同意进入最终仲裁"
             )
             confirm.click()
+            select_tab(app, "④ 最终仲裁")
+            self.assertEqual(database.confirm_calls, 0)
+            next(
+                button for button in app.button if button.label == "返回"
+            ).click()
+            app.run(timeout=15)
+            self.assertEqual(database.confirm_calls, 0)
+            self.assertEqual(database.status, "ARBITRATION_PENDING")
+            select_tab(app, "④ 最终仲裁")
+            next(
+                button
+                for button in app.button
+                if button.label == "同意进入最终仲裁"
+            ).click()
+            select_tab(app, "④ 最终仲裁")
+            next(
+                button
+                for button in app.button
+                if button.label == "确认并冻结证据"
+            ).click()
+            app.run(timeout=15)
             select_tab(app, "④ 最终仲裁")
             self.assertEqual(database.confirm_calls, 1)
             select_tab(app, "④ 最终仲裁")
@@ -260,7 +362,7 @@ class ArbitrationUITests(unittest.TestCase):
     def test_closed_case_only_displays_final_judgment(self):
         database = FakeDatabase("CLOSED", requester="A", role="A")
         app_path, patches = self.run_app(database, "A")
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app = AppTest.from_file(app_path)
             app.session_state["auth"] = {"case_id": "CASE-UI", "role": "A"}
             app.run(timeout=15)
@@ -274,10 +376,46 @@ class ArbitrationUITests(unittest.TestCase):
                 )
             )
 
+    def test_persistent_notification_is_read_only_after_acknowledgement(self):
+        expected = {
+            "ARBITRATION_DECLINED": "B 选择继续调解",
+            "ARBITRATION_ACCEPTED": "B 已同意进入最终仲裁",
+        }
+        for event_type, message in expected.items():
+            with self.subTest(event_type=event_type):
+                database = FakeDatabase("MEDIATING", role="A")
+                database.notifications.append(
+                    {
+                        "id": 1,
+                        "event_type": event_type,
+                        "recipient_role": "A",
+                        "actor_role": "B",
+                        "read_at": None,
+                    }
+                )
+                app_path, patches = self.run_app(database, "A")
+                with patches[0], patches[1], patches[2], patches[3]:
+                    app = AppTest.from_file(app_path)
+                    app.session_state["auth"] = {
+                        "case_id": "CASE-UI",
+                        "role": "A",
+                    }
+                    app.run(timeout=15)
+                    self.assertIn(message, visible_text(app.markdown))
+                    self.assertIsNone(database.notifications[0]["read_at"])
+                    next(
+                        button
+                        for button in app.button
+                        if button.label == "知道了"
+                    ).click()
+                    app.run(timeout=15)
+                    self.assertEqual(database.notifications[0]["read_at"], "now")
+                    self.assertNotIn(message, visible_text(app.markdown))
+
     def test_closed_result_appears_on_next_normal_rerun(self):
         database = FakeDatabase("ARBITRATING", requester="A", role="A")
         app_path, patches = self.run_app(database, "A")
-        with patches[0], patches[1], patches[2]:
+        with patches[0], patches[1], patches[2], patches[3]:
             app = AppTest.from_file(app_path)
             app.session_state["auth"] = {"case_id": "CASE-UI", "role": "A"}
             app.run(timeout=15)

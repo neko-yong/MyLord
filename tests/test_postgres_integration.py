@@ -1,15 +1,22 @@
-import os
 import threading
 import unittest
 import uuid
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from db import CaseStateError, Database, StatementAlreadySubmitted
+from db import (
+    CaseStateError,
+    Database,
+    DatabaseError,
+    StatementAlreadySubmitted,
+)
 from dev_tools import delete_dev_case, get_dev_state, seed_dev_case
+from integration_config import load_test_database_url
 from validation import build_statement_content
 
 
 DEV_SETTINGS = SimpleNamespace(dev_mode=True)
+TEST_DATABASE_URL, _TEST_DATABASE_SOURCE = load_test_database_url()
 
 
 def valid_statement(role, run_id):
@@ -30,17 +37,20 @@ def valid_statement(role, run_id):
 
 
 @unittest.skipUnless(
-    os.getenv("TEST_DATABASE_URL"),
+    TEST_DATABASE_URL,
     "POSTGRES_REAL_TEST = NOT RUN (TEST_DATABASE_URL is not set)",
 )
 class PostgreSQLIntegrationTests(unittest.TestCase):
+    gate_run_prefix = f"INTERACTION_GATE_{uuid.uuid4().hex}"
+    gate_case_ids = set()
+
     @classmethod
     def setUpClass(cls):
         cls.first_session = Database(
-            os.environ["TEST_DATABASE_URL"], min_size=1, max_size=2
+            TEST_DATABASE_URL, min_size=1, max_size=2
         )
         cls.second_session = Database(
-            os.environ["TEST_DATABASE_URL"], min_size=1, max_size=2
+            TEST_DATABASE_URL, min_size=1, max_size=2
         )
         cls.first_session.init_db()
 
@@ -49,10 +59,17 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         cls.first_session.close()
         cls.second_session.close()
 
-    def _create_map_ready_case(self, prefix):
+    def _create_gate_case(self, label):
         run_id = uuid.uuid4().hex
         case_id, a_token, b_token = self.first_session.create_case(
-            f"{prefix}_{run_id}"
+            f"{self.gate_run_prefix}_{label}_{run_id}"
+        )
+        type(self).gate_case_ids.add(case_id)
+        return run_id, case_id, a_token, b_token
+
+    def _create_map_ready_case(self, prefix):
+        run_id, case_id, a_token, b_token = self._create_gate_case(
+            prefix
         )
         try:
             for database, role, empty_content in (
@@ -104,13 +121,60 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                     (SELECT COUNT(*) FROM messages WHERE case_id = %s)
                         AS messages,
                     (SELECT COUNT(*) FROM artifacts WHERE case_id = %s)
-                        AS artifacts
+                        AS artifacts,
+                    (SELECT COUNT(*) FROM case_notifications WHERE case_id = %s)
+                        AS notifications
                 """,
-                (case_id, case_id, case_id, case_id),
+                (case_id, case_id, case_id, case_id, case_id),
             ).fetchone()
         self.assertEqual(
             residual,
-            {"cases": 0, "statements": 0, "messages": 0, "artifacts": 0},
+            {
+                "cases": 0,
+                "statements": 0,
+                "messages": 0,
+                "artifacts": 0,
+                "notifications": 0,
+            },
+        )
+
+    def test_schema_initialization_has_required_tables(self):
+        required_tables = {
+            "cases",
+            "statements",
+            "messages",
+            "artifacts",
+            "case_notifications",
+        }
+        with self.first_session._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name = ANY(%s)
+                """,
+                (list(required_tables),),
+            ).fetchall()
+            notification_columns = connection.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'case_notifications'
+                """
+            ).fetchall()
+        self.assertEqual({row["table_name"] for row in rows}, required_tables)
+        self.assertTrue(
+            {
+                "id",
+                "case_id",
+                "recipient_role",
+                "event_type",
+                "actor_role",
+                "created_at",
+                "read_at",
+            }.issubset({row["column_name"] for row in notification_columns})
         )
 
     def test_developer_scenarios_use_real_postgres_and_cleanup(self):
@@ -128,6 +192,7 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                     "weekend_plan",
                     scenario,
                 )
+                type(self).gate_case_ids.add(dev_case.case_id)
                 try:
                     state = get_dev_state(
                         DEV_SETTINGS,
@@ -204,12 +269,74 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             request = database_a.request_arbitration(case_id, "A")
             self.assertEqual(request["status"], "ARBITRATION_PENDING")
             self.assertEqual(request["arbitration_requested_by"], "A")
+            database_b.cancel_arbitration_request(case_id, "B")
+            persistence_reader = Database(
+                TEST_DATABASE_URL,
+                min_size=1,
+                max_size=1,
+            )
+            try:
+                declined = persistence_reader.get_unread_notifications(
+                    case_id,
+                    "A",
+                )
+            finally:
+                persistence_reader.close()
+            self.assertEqual(len(declined), 1)
+            self.assertEqual(
+                declined[0]["event_type"],
+                "ARBITRATION_DECLINED",
+            )
+            self.assertEqual(database_b.get_unread_notifications(case_id, "B"), [])
+            self.assertTrue(
+                database_a.mark_notification_read(
+                    case_id,
+                    declined[0]["id"],
+                    "A",
+                )
+            )
+            self.assertEqual(
+                database_a.get_unread_notifications(case_id, "A"),
+                [],
+            )
+            with database_a._connection() as connection:
+                declined_read_at = connection.execute(
+                    """
+                    SELECT read_at
+                    FROM case_notifications
+                    WHERE id = %s AND case_id = %s
+                    """,
+                    (declined[0]["id"], case_id),
+                ).fetchone()["read_at"]
+            self.assertIsNotNone(declined_read_at)
+            request = database_a.request_arbitration(case_id, "A")
+            self.assertEqual(request["status"], "ARBITRATION_PENDING")
             database_a.add_message(case_id, "A", f"PENDING_MSG_A_{run_id}")
             database_b.add_message(case_id, "B", f"PENDING_MSG_B_{run_id}")
             database_b.ensure_judge_intervention_allowed(case_id)
             self.assertFalse(database_a.pause_case(case_id, "A"))
 
             evidence = database_b.confirm_arbitration(case_id, "B")
+            persistence_reader = Database(
+                TEST_DATABASE_URL,
+                min_size=1,
+                max_size=1,
+            )
+            try:
+                accepted = persistence_reader.get_unread_notifications(
+                    case_id,
+                    "A",
+                )
+            finally:
+                persistence_reader.close()
+            self.assertEqual(len(accepted), 1)
+            self.assertEqual(
+                accepted[0]["event_type"],
+                "ARBITRATION_ACCEPTED",
+            )
+            self.assertEqual(accepted[0]["actor_role"], "B")
+            self.assertEqual(accepted[0]["recipient_role"], "A")
+            self.assertEqual(database_b.get_unread_notifications(case_id, "B"), [])
             snapshot = evidence["snapshot"]
             snapshot_hash = evidence["evidence_hash"]
             self.assertEqual(database_a.get_case(case_id)["status"], "ARBITRATING")
@@ -366,6 +493,229 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         finally:
             self._cleanup_and_assert(case_id)
 
+    def test_notification_failure_rolls_back_decline_and_accept(self):
+        _run_id, case_id, _a_token, _b_token = self._create_map_ready_case(
+            "NOTIFICATION_ROLLBACK"
+        )
+        try:
+            self.first_session.add_message(case_id, "A", "Rollback marker")
+            self.first_session.request_arbitration(case_id, "A")
+
+            with patch.object(
+                Database,
+                "_insert_notification",
+                side_effect=DatabaseError("injected notification failure"),
+            ):
+                with self.assertRaises(DatabaseError):
+                    self.second_session.cancel_arbitration_request(case_id, "B")
+
+            after_decline_failure = self.first_session.get_case(case_id)
+            self.assertEqual(
+                after_decline_failure["status"],
+                "ARBITRATION_PENDING",
+            )
+            self.assertEqual(
+                after_decline_failure["arbitration_requested_by"],
+                "A",
+            )
+            self.assertEqual(
+                self.first_session.get_unread_notifications(case_id, "A"),
+                [],
+            )
+
+            with patch.object(
+                Database,
+                "_insert_notification",
+                side_effect=DatabaseError("injected notification failure"),
+            ):
+                with self.assertRaises(DatabaseError):
+                    self.second_session.confirm_arbitration(case_id, "B")
+
+            after_accept_failure = self.first_session.get_case(case_id)
+            self.assertEqual(
+                after_accept_failure["status"],
+                "ARBITRATION_PENDING",
+            )
+            self.assertEqual(
+                after_accept_failure["arbitration_requested_by"],
+                "A",
+            )
+            self.assertIsNone(
+                self.first_session.get_arbitration_evidence(case_id)
+            )
+            self.assertEqual(
+                self.first_session.get_unread_notifications(case_id, "A"),
+                [],
+            )
+        finally:
+            self._cleanup_and_assert(case_id)
+
+    def test_auto_map_flow_starts_only_after_second_statement(self):
+        run_id, case_id, _a_token, _b_token = self._create_gate_case(
+            "AUTO_MAP"
+        )
+        generation = Mock(return_value=f"MAP_{run_id}")
+        try:
+            self.first_session.save_statement(
+                case_id,
+                "A",
+                valid_statement("A", run_id),
+            )
+            self.assertEqual(generation.call_count, 0)
+            self.assertIsNone(
+                self.first_session.get_artifact(case_id, "DISPUTE_MAP")
+            )
+            self.assertEqual(
+                self.first_session.get_case(case_id)["status"],
+                "COLLECTING",
+            )
+
+            self.second_session.save_statement(
+                case_id,
+                "B",
+                valid_statement("B", run_id),
+            )
+            self.assertEqual(
+                self.first_session.get_case(case_id)["status"],
+                "READY_FOR_MAP",
+            )
+            reservation = self.first_session.claim_artifact(
+                case_id,
+                "DISPUTE_MAP",
+            )
+            self.assertIsNotNone(reservation)
+            self.first_session.complete_artifact(
+                case_id,
+                reservation,
+                "DISPUTE_MAP",
+                generation(),
+            )
+            self.assertEqual(generation.call_count, 1)
+            self.assertEqual(
+                self.second_session.get_case(case_id)["status"],
+                "MAP_READY",
+            )
+        finally:
+            self._cleanup_and_assert(case_id)
+
+    def test_concurrent_dispute_map_claim_and_failed_retry_have_one_winner(self):
+        run_id, case_id, _a_token, _b_token = self._create_gate_case(
+            "MAP_CLAIM"
+        )
+        self.first_session.save_statement(
+            case_id,
+            "A",
+            valid_statement("A", run_id),
+        )
+        self.second_session.save_statement(
+            case_id,
+            "B",
+            valid_statement("B", run_id),
+        )
+        barrier = threading.Barrier(2)
+        claims = []
+
+        def claim(database):
+            barrier.wait()
+            claims.append(database.claim_artifact(case_id, "DISPUTE_MAP"))
+
+        first = threading.Thread(target=claim, args=(self.first_session,))
+        second = threading.Thread(target=claim, args=(self.second_session,))
+        try:
+            first.start()
+            second.start()
+            first.join(timeout=30)
+            second.join(timeout=30)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            winners = [claim_id for claim_id in claims if claim_id is not None]
+            self.assertEqual(len(winners), 1)
+            reservation = winners[0]
+
+            with self.first_session._connection() as connection:
+                artifact_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM artifacts
+                    WHERE case_id = %s AND kind = 'DISPUTE_MAP'
+                    """,
+                    (case_id,),
+                ).fetchone()["count"]
+            self.assertEqual(artifact_count, 1)
+
+            self.assertTrue(
+                self.first_session.fail_artifact(
+                    case_id,
+                    reservation,
+                    "DISPUTE_MAP",
+                )
+            )
+            failed_artifact = self.second_session.get_artifact(
+                case_id,
+                "DISPUTE_MAP",
+            )
+            self.assertEqual(failed_artifact["content"], "")
+            self.assertIsNotNone(failed_artifact["generation_failed_at"])
+            self.assertEqual(
+                self.first_session.get_case(case_id)["status"],
+                "READY_FOR_MAP",
+            )
+            self.assertIsNotNone(
+                self.first_session.get_statement(case_id, "A")
+            )
+            self.assertIsNotNone(
+                self.second_session.get_statement(case_id, "B")
+            )
+            retry_barrier = threading.Barrier(2)
+            retries = []
+
+            def retry(database):
+                retry_barrier.wait()
+                retries.append(
+                    database.retry_failed_artifact(case_id, "DISPUTE_MAP")
+                )
+
+            first_retry = threading.Thread(
+                target=retry,
+                args=(self.first_session,),
+            )
+            second_retry = threading.Thread(
+                target=retry,
+                args=(self.second_session,),
+            )
+            first_retry.start()
+            second_retry.start()
+            first_retry.join(timeout=30)
+            second_retry.join(timeout=30)
+            self.assertEqual(
+                [retry_id for retry_id in retries if retry_id is not None],
+                [reservation],
+            )
+            generation = Mock(return_value=f"MAP_{run_id}")
+            self.first_session.complete_artifact(
+                case_id,
+                reservation,
+                "DISPUTE_MAP",
+                generation(),
+            )
+            self.assertEqual(generation.call_count, 1)
+            self.assertEqual(
+                self.second_session.get_case(case_id)["status"],
+                "MAP_READY",
+            )
+            with self.first_session._connection() as connection:
+                final_artifact_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM artifacts
+                    WHERE case_id = %s AND kind = 'DISPUTE_MAP'
+                    """,
+                    (case_id,),
+                ).fetchone()["count"]
+            self.assertEqual(final_artifact_count, 1)
+        finally:
+            self._cleanup_and_assert(case_id)
+
     def test_concurrent_requests_keep_one_requester_and_one_snapshot(self):
         _run_id, case_id, _a_token, _b_token = self._create_map_ready_case(
             "EVIDENCE_REQUEST_RACE"
@@ -404,9 +754,47 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                     """,
                     (case_id,),
                 ).fetchone()["count"]
+                notification_count = connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM case_notifications
+                    WHERE case_id = %s AND event_type = 'ARBITRATION_ACCEPTED'
+                    """,
+                    (case_id,),
+                ).fetchone()["count"]
             self.assertEqual(count, 1)
+            self.assertEqual(notification_count, 1)
         finally:
             self._cleanup_and_assert(case_id)
+
+    def test_zz_gate_cases_have_zero_residual(self):
+        case_ids = list(type(self).gate_case_ids)
+        self.assertTrue(case_ids)
+        with self.first_session._connection() as connection:
+            residual = connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM cases WHERE case_id = ANY(%s)) AS cases,
+                    (SELECT COUNT(*) FROM statements WHERE case_id = ANY(%s))
+                        AS statements,
+                    (SELECT COUNT(*) FROM messages WHERE case_id = ANY(%s))
+                        AS messages,
+                    (SELECT COUNT(*) FROM artifacts WHERE case_id = ANY(%s))
+                        AS artifacts,
+                    (SELECT COUNT(*) FROM case_notifications
+                     WHERE case_id = ANY(%s)) AS notifications
+                """,
+                (case_ids, case_ids, case_ids, case_ids, case_ids),
+            ).fetchone()
+        self.assertEqual(
+            residual,
+            {
+                "cases": 0,
+                "statements": 0,
+                "messages": 0,
+                "artifacts": 0,
+                "notifications": 0,
+            },
+        )
 
 
 if __name__ == "__main__":
