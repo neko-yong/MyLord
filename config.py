@@ -12,6 +12,9 @@ class Settings:
     llm_api_key: str
     admin_create_secret: str
     development_mode: bool = False
+    dev_mode: bool = False
+    llm_mode: str = "real"
+    dev_database_mode: str = "real"
 
     @property
     def llm_ready(self):
@@ -33,6 +36,39 @@ def _as_bool(value):
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _strict_bool(name, value, default=False):
+    if value is None or str(value).strip() == "":
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes"}:
+        return True
+    if normalized in {"0", "false", "no"}:
+        return False
+    raise ValueError(
+        f"{name} must be one of: true, false, 1, 0, yes, no."
+    )
+
+
+def _dev_llm_mode(dev_mode, secrets_values, environ):
+    configured = _value("LLM_MODE", secrets_values, environ).lower()
+    if not dev_mode:
+        return "real"
+    mode = configured or "mock"
+    if mode not in {"mock", "real"}:
+        raise ValueError("LLM_MODE must be either mock or real in DEV_MODE.")
+    return mode
+
+
+def _dev_database_mode(dev_mode, secrets_values, environ):
+    configured = _value("DEV_DATABASE_MODE", secrets_values, environ).lower()
+    if not dev_mode:
+        return "real"
+    mode = configured or "real"
+    if mode != "real":
+        raise ValueError("DEV_DATABASE_MODE currently supports only real.")
+    return mode
+
+
 def secure_secret_matches(candidate, expected):
     if not candidate or not expected:
         return False
@@ -48,6 +84,10 @@ def load_settings(
 ):
     secrets_values = secrets_values or {}
     environ = environ or os.environ
+    dev_mode = _strict_bool(
+        "DEV_MODE",
+        _value("DEV_MODE", secrets_values, environ),
+    )
     return Settings(
         database_url=_value("DATABASE_URL", secrets_values, environ),
         llm_endpoint=_value("LLM_ENDPOINT", secrets_values, environ),
@@ -56,5 +96,12 @@ def load_settings(
         admin_create_secret=_value("ADMIN_CREATE_SECRET", secrets_values, environ),
         development_mode=_as_bool(
             _value("DEVELOPMENT_MODE", secrets_values, environ)
+        ),
+        dev_mode=dev_mode,
+        llm_mode=_dev_llm_mode(dev_mode, secrets_values, environ),
+        dev_database_mode=_dev_database_mode(
+            dev_mode,
+            secrets_values,
+            environ,
         ),
     )

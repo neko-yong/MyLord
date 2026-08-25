@@ -360,6 +360,22 @@ class Database:
 
         raise DatabaseUnavailable("无法生成唯一案件编号，请稍后重试。")
 
+    def delete_case_if_title_prefix(self, case_id, title_prefix):
+        if not isinstance(title_prefix, str) or not title_prefix:
+            raise ValueError("案件标题前缀不能为空。")
+        with self._connection() as connection:
+            case = connection.execute(
+                "SELECT title FROM cases WHERE case_id = %s FOR UPDATE",
+                (case_id,),
+            ).fetchone()
+            if not case or not case["title"].startswith(title_prefix):
+                return False
+            result = connection.execute(
+                "DELETE FROM cases WHERE case_id = %s",
+                (case_id,),
+            )
+        return result.rowcount == 1
+
     def authenticate(self, case_id, token):
         clean_case_id = case_id.strip().upper()
         candidate_hash = hash_token(token)

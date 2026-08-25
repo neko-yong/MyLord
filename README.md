@@ -92,6 +92,11 @@ LLM_API_KEY = "YOUR_API_KEY"
 
 ADMIN_CREATE_SECRET = "YOUR_ADMIN_CREATE_SECRET"
 DEVELOPMENT_MODE = true
+
+# Local developer tooling only. Never enable on the production deployment.
+DEV_MODE = false
+LLM_MODE = "real"
+DEV_DATABASE_MODE = "real"
 ```
 
 同名环境变量也可用于本地开发；Streamlit Secrets 优先于环境变量。
@@ -158,9 +163,17 @@ LLM_API_KEY = "YOUR_API_KEY"
 
 ADMIN_CREATE_SECRET = "YOUR_ADMIN_CREATE_SECRET"
 DEVELOPMENT_MODE = false
+DEV_MODE = false
+LLM_MODE = "real"
+DEV_DATABASE_MODE = "real"
 ```
 
 不要把 `.streamlit/secrets.toml` 提交到 GitHub。公开部署保持 `DEVELOPMENT_MODE = false`，避免向普通用户显示技术诊断信息。
+
+同时必须保持 `DEV_MODE = false`（或完全不配置）。即使误配
+`LLM_MODE = "mock"`，应用也会在 `DEV_MODE = false` 时强制使用正式
+LLM 路径。不要在 Streamlit Cloud 正式环境启用 Developer Playground；
+它不是管理员后台或生产运维后台。
 
 ## 6. Open Public URL
 
@@ -211,3 +224,50 @@ python -m unittest discover -s tests -v
 ```
 
 需要真实测试库时，先设置 `TEST_DATABASE_URL` 再运行测试。未配置时 PostgreSQL 集成测试会明确报告 `POSTGRES_REAL_TEST = NOT RUN`，不会伪造结果。
+
+## Developer Workflow
+
+Developer Playground 只用于本地或独立测试部署，提供标准虚构 Fixture、
+合法状态机 Scenario、Mock LLM、失败注入、A/B 快速视图和安全调试面板。
+它不通过 query parameter、cookie、普通表单或管理员创建口令开启；唯一入口
+是服务端 `DEV_MODE`。所有测试案件使用 `[DEV_TEST]` 标题前缀，删除和身份
+切换会在服务端再次校验此前缀。
+
+### DEV_FAST
+
+```toml
+DEV_MODE = true
+LLM_MODE = "mock"
+DEV_DATABASE_MODE = "real"
+```
+
+用于表单、UI 和状态机开发。Fixture 数据与 Mock 输出不会调用 DeepSeek，
+通常可在几十秒内直接到达 `MEDIATING`、`ARBITRATING` 或 `CLOSED`。
+
+### DEV_INTEGRATION
+
+```toml
+DEV_MODE = true
+LLM_MODE = "mock"
+DEV_DATABASE_MODE = "real"
+```
+
+连接真实测试 PostgreSQL，用于并发、Evidence Freeze、checkpoint 恢复和
+数据库完整性验证。请使用专用 `TEST_DATABASE_URL`，并精确清理生成的
+`[DEV_TEST]` 案件。
+
+### RELEASE_SMOKE
+
+```toml
+DEV_MODE = false
+LLM_MODE = "real"
+DEV_DATABASE_MODE = "real"
+```
+
+使用真实 PostgreSQL 与真实 DeepSeek 完成发布前冒烟。正式 Streamlit Cloud
+Secrets 绝不能设置 `DEV_MODE = true`，除非该部署明确是隔离测试环境。
+
+Playground 中选择 **Real** 会显示费用警告并要求本次会话确认；默认始终是
+**Mock**。真实模式继续使用现有正式 Prompt、DeepSeek 配置、token budget 与
+checkpoint，不使用测试 Prompt。Raw A/B Token 仅在创建该 Dev Case 的当前
+`st.session_state` 中短暂保存，不写入数据库明文，也不在调试面板中展示。

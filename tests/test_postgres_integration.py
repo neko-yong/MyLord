@@ -2,9 +2,14 @@ import os
 import threading
 import unittest
 import uuid
+from types import SimpleNamespace
 
 from db import CaseStateError, Database, StatementAlreadySubmitted
+from dev_tools import delete_dev_case, get_dev_state, seed_dev_case
 from validation import build_statement_content
+
+
+DEV_SETTINGS = SimpleNamespace(dev_mode=True)
 
 
 def valid_statement(role, run_id):
@@ -107,6 +112,73 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             residual,
             {"cases": 0, "statements": 0, "messages": 0, "artifacts": 0},
         )
+
+    def test_developer_scenarios_use_real_postgres_and_cleanup(self):
+        scenarios = (
+            "MEDIATING",
+            "ARBITRATION_PENDING_A",
+            "ARBITRATING",
+            "CLOSED",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                dev_case = seed_dev_case(
+                    DEV_SETTINGS,
+                    self.first_session,
+                    "weekend_plan",
+                    scenario,
+                )
+                try:
+                    state = get_dev_state(
+                        DEV_SETTINGS,
+                        self.second_session,
+                        dev_case.case_id,
+                    )
+                    self.assertTrue(state["a_submitted"])
+                    self.assertTrue(state["b_submitted"])
+                    self.assertTrue(state["dispute_map"])
+                    self.assertGreaterEqual(state["message_count"], 1)
+
+                    if scenario == "MEDIATING":
+                        self.assertEqual(state["status"], "MEDIATING")
+                        self.assertFalse(state["evidence"])
+                        self.assertFalse(state["final"])
+                    elif scenario == "ARBITRATION_PENDING_A":
+                        self.assertEqual(
+                            state["status"],
+                            "ARBITRATION_PENDING",
+                        )
+                        self.assertEqual(state["arbitration_request"], "A")
+                        self.assertFalse(state["evidence"])
+                        self.second_session.add_message(
+                            dev_case.case_id,
+                            "B",
+                            "开发集成测试：待确认阶段消息仍可写。",
+                        )
+                    elif scenario == "ARBITRATING":
+                        self.assertEqual(state["status"], "ARBITRATING")
+                        self.assertTrue(state["evidence"])
+                        self.assertTrue(state["evidence_hash_preview"])
+                        with self.assertRaises(CaseStateError):
+                            self.second_session.add_message(
+                                dev_case.case_id,
+                                "A",
+                                "开发集成测试：冻结后必须拒绝。",
+                            )
+                    elif scenario == "CLOSED":
+                        self.assertEqual(state["status"], "CLOSED")
+                        self.assertTrue(state["evidence"])
+                        self.assertTrue(state["judgment_normal"])
+                        self.assertTrue(state["judgment_swapped"])
+                        self.assertTrue(state["meta"])
+                        self.assertTrue(state["final"])
+                finally:
+                    delete_dev_case(
+                        DEV_SETTINGS,
+                        self.first_session,
+                        dev_case.case_id,
+                    )
+                    self._cleanup_and_assert(dev_case.case_id)
 
     def test_shared_case_and_evidence_freeze_flow(self):
         database_a = self.first_session

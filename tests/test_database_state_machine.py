@@ -42,6 +42,34 @@ def database_with(*responses):
 
 
 class ArbitrationStateMachineTests(unittest.TestCase):
+    def test_safe_delete_rechecks_title_prefix_in_transaction(self):
+        database, connection = database_with(
+            Result(row={"title": "[DEV_TEST] fixture"}),
+            Result(rowcount=1),
+        )
+
+        self.assertTrue(
+            database.delete_case_if_title_prefix(
+                "CASE-TEST",
+                "[DEV_TEST] ",
+            )
+        )
+        self.assertIn("FOR UPDATE", connection.calls[0][0])
+        self.assertIn("DELETE FROM cases", connection.calls[1][0])
+
+    def test_safe_delete_refuses_nonmatching_case(self):
+        database, connection = database_with(
+            Result(row={"title": "ordinary case"}),
+        )
+
+        self.assertFalse(
+            database.delete_case_if_title_prefix(
+                "CASE-TEST",
+                "[DEV_TEST] ",
+            )
+        )
+        self.assertEqual(len(connection.calls), 1)
+
     def test_statement_database_gate_rejects_empty_content(self):
         for content in ("", " ", "\n", "     "):
             with self.subTest(content=repr(content)):

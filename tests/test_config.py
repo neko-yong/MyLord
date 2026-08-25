@@ -41,6 +41,56 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.database_url, "")
         self.assertFalse(settings.llm_ready)
         self.assertFalse(settings.admin_create_ready)
+        self.assertFalse(settings.dev_mode)
+        self.assertEqual(settings.llm_mode, "real")
+
+    def test_dev_mode_accepts_only_explicit_boolean_values(self):
+        truthy = (True, 1, "1", "true", "TRUE", "yes", " YES ")
+        falsey = (False, 0, "0", "false", "FALSE", "no", " NO ")
+
+        for value in truthy:
+            with self.subTest(value=value):
+                settings = load_settings({"DEV_MODE": value}, {})
+                self.assertTrue(settings.dev_mode)
+                self.assertEqual(settings.llm_mode, "mock")
+
+        for value in falsey:
+            with self.subTest(value=value):
+                settings = load_settings({"DEV_MODE": value}, {})
+                self.assertFalse(settings.dev_mode)
+                self.assertEqual(settings.llm_mode, "real")
+
+        for value in ("on", "off", "enabled", "disabled", "2"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    load_settings({"DEV_MODE": value}, {})
+
+    def test_production_forces_real_llm_even_if_mock_is_configured(self):
+        settings = load_settings(
+            {"DEV_MODE": "false", "LLM_MODE": "mock"},
+            {},
+        )
+
+        self.assertFalse(settings.dev_mode)
+        self.assertEqual(settings.llm_mode, "real")
+
+    def test_dev_llm_mode_is_strict_and_defaults_to_mock(self):
+        self.assertEqual(
+            load_settings({"DEV_MODE": "true"}, {}).llm_mode,
+            "mock",
+        )
+        self.assertEqual(
+            load_settings(
+                {"DEV_MODE": "true", "LLM_MODE": "real"},
+                {},
+            ).llm_mode,
+            "real",
+        )
+        with self.assertRaises(ValueError):
+            load_settings(
+                {"DEV_MODE": "true", "LLM_MODE": "surprise"},
+                {},
+            )
 
     def test_admin_secret_comparison(self):
         self.assertTrue(secure_secret_matches("correct", "correct"))

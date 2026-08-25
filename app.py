@@ -14,7 +14,20 @@ from db import (
     DatabaseError,
     StatementAlreadySubmitted,
 )
+from dev_fixtures import fixture_options, get_fixture
+from dev_tools import (
+    FAILURE_STAGES,
+    SCENARIOS,
+    FinalCompleteFailureDatabase,
+    delete_dev_case,
+    get_dev_state,
+    is_dev_case,
+    recreate_dev_case,
+    seed_dev_case,
+    switch_dev_role,
+)
 from llm import LLMError, TASK_MAX_TOKENS, call_llm
+from mock_llm import MockLLM
 from prompts import (
     CORE_SYSTEM_PROMPT,
     DISPUTE_MAP_PROMPT,
@@ -88,7 +101,7 @@ def release_reservation(case_id, artifact_id, kind):
 
 
 def start_or_resume_final_arbitration(case_id):
-    if not settings.llm_ready:
+    if not llm_available():
         st.error("AI 法官尚未由网站管理员配置。")
         return False
     try:
@@ -101,9 +114,20 @@ def start_or_resume_final_arbitration(case_id):
         return False
 
     try:
+        arbitration_database = database
+        failure_state = st.session_state.get("dev_failure_state", {})
+        if (
+            settings.dev_mode
+            and failure_state.get("stage") == "FINAL_DB_COMPLETE"
+        ):
+            arbitration_database = FinalCompleteFailureDatabase(
+                settings,
+                database,
+                failure_state,
+            )
         with st.spinner("正在依据冻结证据进行双向复核仲裁…"):
             run_final_arbitration(
-                database=database,
+                database=arbitration_database,
                 ask_llm=ask,
                 case_id=case_id,
                 reservation_id=reservation_id,
@@ -126,15 +150,31 @@ def ask(
     temperature=0.2,
     max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
 ):
-    result = call_llm(
-        endpoint=settings.llm_endpoint,
-        model=settings.llm_model,
-        api_key=settings.llm_api_key,
-        system_prompt=CORE_SYSTEM_PROMPT + "\n\n" + system_extra,
-        user_prompt=user_text,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    if selected_llm_mode() == "mock":
+        result = active_mock_llm()(
+            system_extra,
+            user_text,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    else:
+        if settings.dev_mode and not st.session_state.get(
+            "dev_real_llm_confirmed",
+            False,
+        ):
+            raise LLMError(
+                "dev_real_confirmation",
+                "Real LLM use requires developer confirmation.",
+            )
+        result = call_llm(
+            endpoint=settings.llm_endpoint,
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            system_prompt=CORE_SYSTEM_PROMPT + "\n\n" + system_extra,
+            user_prompt=user_text,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
     logger.info(
         "llm_result model=%s finish_reason=%s prompt_tokens=%s "
         "completion_tokens=%s total_tokens=%s latency_ms=%.2f",
@@ -189,6 +229,276 @@ def observe_fragment(name):
 settings = _load_server_settings()
 st.session_state.setdefault("auth", None)
 
+
+def selected_llm_mode():
+    if not settings.dev_mode:
+        return "real"
+    mode = st.session_state.get("dev_llm_mode", settings.llm_mode)
+    if mode not in {"mock", "real"}:
+        raise LLMError("dev_llm_mode", "Invalid developer LLM mode.")
+    return mode
+
+
+def active_dev_case():
+    if not settings.dev_mode:
+        return None
+    dev_case = st.session_state.get("dev_case")
+    case_id = getattr(dev_case, "case_id", None)
+    if not case_id:
+        return None
+    if not is_dev_case(settings, database, case_id):
+        return None
+    return dev_case
+
+
+def active_mock_llm():
+    if not settings.dev_mode or selected_llm_mode() != "mock":
+        raise PermissionError("Developer Mock LLM is disabled.")
+    dev_case = active_dev_case()
+    if not dev_case:
+        raise LLMError(
+            "dev_mock_case",
+            "Mock LLM is limited to the active DEV_TEST case.",
+        )
+    calls = st.session_state.setdefault("dev_mock_calls", {})
+    failure_state = st.session_state.setdefault(
+        "dev_failure_state",
+        {"stage": "NONE", "triggered": False, "attempts": 0},
+    )
+    return MockLLM(
+        settings,
+        get_fixture(dev_case.fixture_key),
+        calls,
+        failure_state,
+    )
+
+
+def llm_available():
+    if not settings.dev_mode:
+        return settings.llm_ready
+    if selected_llm_mode() == "mock":
+        return active_dev_case() is not None
+    return settings.llm_ready and st.session_state.get(
+        "dev_real_llm_confirmed",
+        False,
+    )
+
+
+def clear_dev_case_state():
+    for key in (
+        "dev_case",
+        "dev_view_role",
+        "dev_mock_calls",
+        "dev_failure_state",
+    ):
+        st.session_state.pop(key, None)
+
+
+def render_developer_playground():
+    if not settings.dev_mode:
+        return
+
+    fixture_by_label = fixture_options()
+    st.session_state.setdefault("dev_llm_mode", settings.llm_mode)
+    st.session_state.setdefault("dev_fixture_label", next(iter(fixture_by_label)))
+    st.session_state.setdefault("dev_scenario", "MEDIATING")
+    st.session_state.setdefault("dev_failure_stage", "NONE")
+    st.session_state.setdefault("dev_real_llm_confirmed", False)
+
+    with st.sidebar.expander("🛠 Developer Playground", expanded=False):
+        fixture_label = st.selectbox(
+            "Fixture",
+            tuple(fixture_by_label),
+            key="dev_fixture_label",
+        )
+        scenario = st.selectbox(
+            "Scenario",
+            SCENARIOS,
+            key="dev_scenario",
+        )
+        llm_mode = st.selectbox(
+            "LLM Mode",
+            ("mock", "real"),
+            format_func=lambda value: value.title(),
+            key="dev_llm_mode",
+        )
+        failure_stage = st.selectbox(
+            "模拟失败阶段",
+            FAILURE_STAGES,
+            format_func=lambda value: "无" if value == "NONE" else value,
+            key="dev_failure_stage",
+        )
+        st.caption("Database：当前连接 · Real PostgreSQL")
+
+        previous_failure = st.session_state.get("dev_failure_state", {})
+        if previous_failure.get("stage") != failure_stage:
+            st.session_state.dev_failure_state = {
+                "stage": failure_stage,
+                "triggered": False,
+                "attempts": 0,
+            }
+
+        if llm_mode == "real":
+            st.warning("⚠ 将产生真实模型调用与费用。")
+            st.checkbox(
+                "确认使用真实 LLM",
+                key="dev_real_llm_confirmed",
+            )
+        else:
+            st.session_state.dev_real_llm_confirmed = False
+
+        if st.button(
+            "创建测试案件",
+            type="primary",
+            icon=":material/add:",
+            width="stretch",
+            key="dev_create_case",
+        ):
+            if llm_mode == "real" and not st.session_state.get(
+                "dev_real_llm_confirmed",
+                False,
+            ):
+                st.error("请先确认真实 LLM 调用与费用。")
+            else:
+                try:
+                    dev_case = seed_dev_case(
+                        settings,
+                        database,
+                        fixture_by_label[fixture_label],
+                        scenario,
+                    )
+                except (DatabaseError, LLMError, RuntimeError, ValueError) as error:
+                    st.error(str(error))
+                else:
+                    st.session_state.dev_case = dev_case
+                    st.session_state.dev_view_role = "A"
+                    st.session_state.dev_mock_calls = dict(
+                        dev_case.seed_mock_calls
+                    )
+                    st.session_state.dev_failure_state = {
+                        "stage": failure_stage,
+                        "triggered": False,
+                        "attempts": 0,
+                    }
+                    st.rerun()
+
+        dev_case = active_dev_case()
+        if not dev_case:
+            if st.session_state.get("dev_case") is not None:
+                clear_dev_case_state()
+            return
+
+        st.divider()
+        st.markdown("#### 当前 Dev Case")
+        state = get_dev_state(settings, database, dev_case.case_id)
+        view_role = st.segmented_control(
+            "查看身份",
+            ("A", "B"),
+            default=st.session_state.get("dev_view_role", "A"),
+            key="dev_role_selector",
+        )
+        st.session_state.dev_view_role = switch_dev_role(
+            settings,
+            database,
+            dev_case.case_id,
+            view_role,
+        )
+        st.markdown(
+            "\n".join(
+                (
+                    f"- Case ID: `{state['case_id']}`",
+                    f"- Status: `{state['status']}`",
+                    f"- Role View: `{st.session_state.dev_view_role}`",
+                    f"- A Submitted: `{'YES' if state['a_submitted'] else 'NO'}`",
+                    f"- B Submitted: `{'YES' if state['b_submitted'] else 'NO'}`",
+                    f"- Dispute Map: `{'YES' if state['dispute_map'] else 'NO'}`",
+                    f"- Messages: `{state['message_count']}`",
+                    f"- Paused By: `{state['paused_by'] or 'NONE'}`",
+                    f"- Arbitration Request: `{state['arbitration_request'] or 'NONE'}`",
+                    f"- Evidence Snapshot: `{'YES' if state['evidence'] else 'NO'}`",
+                    f"- Evidence Cutoff: `{state['evidence_cutoff'] if state['evidence_cutoff'] is not None else 'N/A'}`",
+                    f"- Evidence Hash: `{state['evidence_hash_preview'] or 'N/A'}`",
+                    f"- J1: `{'DONE' if state['judgment_normal'] else 'PENDING'}`",
+                    f"- J2: `{'DONE' if state['judgment_swapped'] else 'PENDING'}`",
+                    f"- Meta: `{'DONE' if state['meta'] else 'PENDING'}`",
+                    f"- Final: `{'DONE' if state['final'] else 'PENDING'}`",
+                )
+            )
+        )
+
+        st.markdown("##### Mock Calls")
+        calls = st.session_state.get("dev_mock_calls", {})
+        for stage in (
+            "DISPUTE_MAP",
+            "JUDGE_INTERVENTION",
+            "JUDGMENT_NORMAL",
+            "JUDGMENT_SWAPPED",
+            "META_JUDGMENT",
+        ):
+            st.caption(f"{stage}: {calls.get(stage, 0)}")
+
+        with st.container(horizontal=True):
+            if st.button(
+                "刷新状态",
+                icon=":material/refresh:",
+                key="dev_refresh",
+            ):
+                st.rerun()
+            if st.button(
+                "重新创建相同场景",
+                icon=":material/replay:",
+                key="dev_recreate",
+            ):
+                try:
+                    replacement = recreate_dev_case(
+                        settings,
+                        database,
+                        dev_case.case_id,
+                        dev_case.fixture_key,
+                        dev_case.scenario,
+                    )
+                except (DatabaseError, LLMError, RuntimeError, ValueError) as error:
+                    st.error(str(error))
+                else:
+                    st.session_state.dev_case = replacement
+                    st.session_state.dev_view_role = "A"
+                    st.session_state.dev_mock_calls = dict(
+                        replacement.seed_mock_calls
+                    )
+                    st.session_state.dev_failure_state = {
+                        "stage": failure_stage,
+                        "triggered": False,
+                        "attempts": 0,
+                    }
+                    st.rerun()
+
+        if st.button(
+            "删除当前测试案件",
+            icon=":material/delete:",
+            width="stretch",
+            key="dev_delete",
+        ):
+            try:
+                delete_dev_case(settings, database, dev_case.case_id)
+            except (DatabaseError, RuntimeError, ValueError) as error:
+                st.error(str(error))
+            else:
+                clear_dev_case_state()
+                st.rerun()
+
+
+def current_auth():
+    dev_case = active_dev_case()
+    if dev_case:
+        role = switch_dev_role(
+            settings,
+            database,
+            dev_case.case_id,
+            st.session_state.get("dev_view_role", "A"),
+        )
+        return {"case_id": dev_case.case_id, "role": role, "dev": True}
+    return st.session_state.auth
+
 st.title("⚖️ 双向关系仲裁员")
 st.caption("独立陈述 → 争议地图 → 共享调解 → 暂停 / 恢复 → 双向复核仲裁")
 
@@ -219,6 +529,9 @@ except DatabaseError as error:
     show_database_error(error)
     st.stop()
 
+render_developer_playground()
+auth = current_auth()
+
 with service_status:
     st.subheader("服务状态")
     st.badge("数据库已连接", color="green", icon=":material/database:")
@@ -228,15 +541,18 @@ with service_status:
         st.badge("AI 法官未配置", color="orange", icon=":material/smart_toy:")
     st.caption("AI 法官用于关系调解与结构化分析，不是法律裁判。")
 
-    if st.session_state.auth:
-        st.caption(f"当前案件：{st.session_state.auth['case_id']}")
-        st.caption(f"当前身份：{st.session_state.auth['role']}")
+    if auth:
+        st.caption(f"当前案件：{auth['case_id']}")
+        st.caption(f"当前身份：{auth['role']}")
         if st.button("退出案件", icon=":material/logout:", width="stretch"):
-            st.session_state.auth = None
+            if auth.get("dev"):
+                clear_dev_case_state()
+            else:
+                st.session_state.auth = None
             st.rerun()
 
 
-if not st.session_state.auth:
+if not auth:
     with st.container(border=True):
         st.subheader("进入已有案件")
         with st.form("login_form"):
@@ -330,10 +646,13 @@ if not st.session_state.auth:
     st.stop()
 
 
-case_id = st.session_state.auth.get("case_id", "")
-role = st.session_state.auth.get("role")
+case_id = auth.get("case_id", "")
+role = auth.get("role")
 if role not in {"A", "B"}:
-    st.session_state.auth = None
+    if auth.get("dev"):
+        clear_dev_case_state()
+    else:
+        st.session_state.auth = None
     st.error("当前登录状态无效，请重新进入案件。")
     st.stop()
 
@@ -344,7 +663,10 @@ except DatabaseError as error:
     st.stop()
 
 if not case:
-    st.session_state.auth = None
+    if auth.get("dev"):
+        clear_dev_case_state()
+    else:
+        st.session_state.auth = None
     st.error("案件不存在或已不可用，请重新进入。")
     st.stop()
 
@@ -497,7 +819,7 @@ if tabs[1].open:
                 icon=":material/account_tree:",
                 width="stretch",
             ):
-                if not settings.llm_ready:
+                if not llm_available():
                     st.error("AI 法官尚未由网站管理员配置。")
                 else:
                     try:
@@ -678,12 +1000,12 @@ if tabs[2].open:
                     else:
                         st.rerun(scope="fragment")
 
-                if not settings.llm_ready:
+                if not llm_available():
                     st.caption("AI 法官尚未由网站管理员配置，双方仍可继续共享对话。")
                 if st.button(
                     "请法官介入",
                     icon=":material/gavel:",
-                    disabled=not settings.llm_ready,
+                    disabled=not llm_available(),
                 ):
                     try:
                         database.ensure_judge_intervention_allowed(case_id)
@@ -822,9 +1144,9 @@ if tabs[3].open:
                             "同意进入最终仲裁",
                             type="primary",
                             icon=":material/lock:",
-                            disabled=not settings.llm_ready,
+                            disabled=not llm_available(),
                         )
-                    if not settings.llm_ready:
+                    if not llm_available():
                         st.caption("AI 法官尚未配置，暂时不能冻结并启动最终仲裁。")
                     if continue_mediation:
                         try:
