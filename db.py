@@ -15,6 +15,13 @@ from evidence import (
     evidence_hash,
     load_evidence_snapshot,
 )
+from secret_redaction import (
+    install_postgres_pool_log_redaction,
+    safe_exception_type,
+)
+
+
+install_postgres_pool_log_redaction()
 
 
 CASE_STATUSES = {
@@ -67,6 +74,12 @@ class CaseStateError(DatabaseError):
 
 class _CaseIdCollision(Exception):
     pass
+
+
+def _safe_database_unavailable(message, error):
+    return DatabaseUnavailable(
+        f"{message}（{safe_exception_type(error)}）"
+    )
 
 
 SCHEMA_STATEMENTS = (
@@ -271,50 +284,99 @@ def _evidence_record(row):
     }
 
 
+def create_postgres_pool(
+    database_url,
+    min_size=2,
+    max_size=5,
+    pool_timeout=10,
+    connect_timeout=20,
+    open_timeout=30,
+):
+    if not database_url:
+        raise DatabaseUnavailable("数据库尚未配置。")
+
+    pool = None
+    try:
+        pool = ConnectionPool(
+            conninfo=database_url,
+            min_size=min_size,
+            max_size=max_size,
+            timeout=pool_timeout,
+            max_idle=60,
+            max_lifetime=1800,
+            reconnect_timeout=30,
+            check=ConnectionPool.check_connection,
+            open=False,
+            kwargs={
+                "row_factory": dict_row,
+                # Also works with Supabase transaction-mode poolers.
+                "prepare_threshold": None,
+                "autocommit": True,
+                "connect_timeout": connect_timeout,
+                "sslmode": "require",
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 3,
+            },
+        )
+        pool.open(wait=True, timeout=open_timeout)
+    except (PsycopgError, PoolClosed, PoolTimeout, ValueError) as exc:
+        if pool is not None:
+            try:
+                pool.close()
+            except Exception:
+                pass
+        raise _safe_database_unavailable(
+            "无法连接共享数据库，请稍后重试。",
+            exc,
+        ) from None
+    return pool
+
+
+def initialize_postgres_schema(pool, pool_timeout=10):
+    try:
+        with pool.connection(timeout=pool_timeout) as connection:
+            for statement in SCHEMA_STATEMENTS:
+                connection.execute(statement)
+    except (PsycopgError, PoolClosed, PoolTimeout) as exc:
+        raise _safe_database_unavailable(
+            "共享数据库暂时不可用，请稍后重试。",
+            exc,
+        ) from None
+
+
 class Database:
+    create_pool = staticmethod(create_postgres_pool)
+
     def __init__(
         self,
-        database_url,
+        database_url=None,
         min_size=2,
         max_size=5,
         pool_timeout=10,
         connect_timeout=20,
         open_timeout=30,
+        pool=None,
     ):
-        if not database_url:
-            raise DatabaseUnavailable("数据库尚未配置。")
-
-        self._pool = None
         self._pool_timeout = pool_timeout
-        try:
-            self._pool = ConnectionPool(
-                conninfo=database_url,
+        self._owns_pool = pool is None
+        self._pool = (
+            pool
+            if pool is not None
+            else self.create_pool(
+                database_url,
                 min_size=min_size,
                 max_size=max_size,
-                timeout=pool_timeout,
-                max_idle=60,
-                max_lifetime=1800,
-            reconnect_timeout=30,
-            check=ConnectionPool.check_connection,
-            open=False,
-                kwargs={
-                    "row_factory": dict_row,
-                    # Also works with Supabase transaction-mode poolers.
-                    "prepare_threshold": None,
-                    "autocommit": True,
-                    "connect_timeout": connect_timeout,
-                    "sslmode": "require",
-                    "keepalives": 1,
-                    "keepalives_idle": 30,
-                    "keepalives_interval": 10,
-                    "keepalives_count": 3,
-                },
+                pool_timeout=pool_timeout,
+                connect_timeout=connect_timeout,
+                open_timeout=open_timeout,
             )
-            self._pool.open(wait=True, timeout=open_timeout)
-        except (PsycopgError, PoolClosed, PoolTimeout, ValueError) as exc:
-            if self._pool is not None:
-                self._pool.close()
-            raise DatabaseUnavailable("无法连接共享数据库，请稍后重试。") from exc
+        )
+
+    @property
+    def pool(self):
+        return self._pool
 
     @contextmanager
     def _connection(self):
@@ -325,7 +387,10 @@ class Database:
         except DatabaseError:
             raise
         except (PsycopgError, PoolClosed, PoolTimeout) as exc:
-            raise DatabaseUnavailable("共享数据库暂时不可用，请稍后重试。") from exc
+            raise _safe_database_unavailable(
+                "共享数据库暂时不可用，请稍后重试。",
+                exc,
+            ) from None
 
     def _read_query(self, statement, params=(), fetch_all=False):
         for attempt in range(2):
@@ -338,24 +403,24 @@ class Database:
             except (InterfaceError, OperationalError, PoolTimeout) as exc:
                 if attempt == 0:
                     continue
-                raise DatabaseUnavailable(
-                    "共享数据库暂时不可用，请稍后重试。"
-                ) from exc
+                raise _safe_database_unavailable(
+                    "共享数据库暂时不可用，请稍后重试。",
+                    exc,
+                ) from None
             except (PsycopgError, PoolClosed) as exc:
-                raise DatabaseUnavailable(
-                    "共享数据库暂时不可用，请稍后重试。"
-                ) from exc
+                raise _safe_database_unavailable(
+                    "共享数据库暂时不可用，请稍后重试。",
+                    exc,
+                ) from None
 
         raise DatabaseUnavailable("共享数据库暂时不可用，请稍后重试。")
 
     def close(self):
-        if self._pool is not None:
+        if self._owns_pool and self._pool is not None:
             self._pool.close()
 
     def init_db(self):
-        with self._connection() as connection:
-            for statement in SCHEMA_STATEMENTS:
-                connection.execute(statement)
+        initialize_postgres_schema(self._pool, self._pool_timeout)
 
     def health_check(self):
         row = self._read_query("SELECT 1 AS ok")

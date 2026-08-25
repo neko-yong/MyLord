@@ -1,16 +1,16 @@
 import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping, Any
 
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str
-    llm_endpoint: str
+    database_url: str = field(repr=False)
+    llm_endpoint: str = field(repr=False)
     llm_model: str
-    llm_api_key: str
-    admin_create_secret: str
+    llm_api_key: str = field(repr=False)
+    admin_create_secret: str = field(repr=False)
     development_mode: bool = False
     dev_mode: bool = False
     llm_mode: str = "real"

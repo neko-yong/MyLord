@@ -1,9 +1,10 @@
-import re
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlparse
 
 import requests
+
+from secret_redaction import redact_secrets
 
 
 MAX_TECHNICAL_DETAIL = 2000
@@ -76,20 +77,7 @@ class LLMError(Exception):
 
 
 def _redact(text, api_key):
-    safe = str(text)
-    if api_key:
-        safe = safe.replace(api_key, "[REDACTED]")
-    safe = re.sub(
-        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,\"'}]+",
-        r"\1[REDACTED]",
-        safe,
-    )
-    safe = re.sub(
-        r"(?i)(api[_-]?key\s*[:=]\s*)[^\s,\"'}]+",
-        r"\1[REDACTED]",
-        safe,
-    )
-    return safe[:MAX_TECHNICAL_DETAIL]
+    return redact_secrets(text, (api_key,))[:MAX_TECHNICAL_DETAIL]
 
 
 def _validate_configuration(endpoint, model, api_key):
@@ -176,12 +164,15 @@ def call_llm(
             json=payload,
             timeout=timeout,
         )
-    except requests.Timeout as exc:
-        raise LLMError("timeout", "The LLM request timed out.") from exc
-    except requests.ConnectionError as exc:
-        raise LLMError("connection", "The LLM service could not be reached.") from exc
+    except requests.Timeout:
+        raise LLMError("timeout", "The LLM request timed out.") from None
+    except requests.ConnectionError:
+        raise LLMError(
+            "connection",
+            "The LLM service could not be reached.",
+        ) from None
     except requests.RequestException as exc:
-        raise LLMError("request", _redact(exc, api_key)) from exc
+        raise LLMError("request", _redact(exc, api_key)) from None
 
     latency_ms = (time.perf_counter() - started) * 1000
 
@@ -190,12 +181,12 @@ def call_llm(
 
     try:
         data = response.json()
-    except ValueError as exc:
+    except ValueError:
         raise LLMError(
             "response_json",
             _redact(response.text, api_key),
             status_code=response.status_code,
-        ) from exc
+        ) from None
 
     try:
         choices = data["choices"]
@@ -204,12 +195,12 @@ def call_llm(
         content = message["content"]
         if not isinstance(content, str) or not content.strip():
             raise TypeError("message.content is empty or not text")
-    except (KeyError, IndexError, TypeError) as exc:
+    except (KeyError, IndexError, TypeError):
         raise LLMError(
             "response_schema",
             "Chat completion response did not contain usable final content.",
             status_code=response.status_code,
-        ) from exc
+        ) from None
 
     finish_reason = choice.get("finish_reason")
     if finish_reason is not None and not isinstance(finish_reason, str):

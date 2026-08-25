@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from config import load_settings, secure_secret_matches
 
@@ -36,9 +37,10 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.database_url, "postgresql://environment-value")
 
     def test_missing_values_are_not_reported_ready(self):
-        settings = load_settings({}, {})
+        with patch.dict("os.environ", {}, clear=True):
+            settings = load_settings({}, {})
 
-        self.assertEqual(settings.database_url, "")
+        self.assertFalse(bool(settings.database_url))
         self.assertFalse(settings.llm_ready)
         self.assertFalse(settings.admin_create_ready)
         self.assertFalse(settings.dev_mode)

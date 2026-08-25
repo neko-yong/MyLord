@@ -1,4 +1,3 @@
-import atexit
 import logging
 import os
 import time
@@ -8,9 +7,9 @@ import streamlit as st
 
 from arbitration import retry_database_write, run_final_arbitration
 from config import load_settings, secure_secret_matches
+from database_resources import get_database
 from db import (
     CaseStateError,
-    Database,
     DatabaseError,
     StatementAlreadySubmitted,
 )
@@ -62,18 +61,6 @@ logger = logging.getLogger(__name__)
 def _load_server_settings():
     secret_values = st.secrets if st.secrets.load_if_toml_exists() else {}
     return load_settings(secret_values)
-
-
-@st.cache_resource(show_spinner=False)
-def get_database(database_url):
-    database = Database(database_url)
-    try:
-        database.init_db()
-    except DatabaseError:
-        database.close()
-        raise
-    atexit.register(database.close)
-    return database
 
 
 def show_database_error(error):

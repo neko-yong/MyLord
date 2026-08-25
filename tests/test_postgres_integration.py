@@ -4,6 +4,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import database_resources
 from db import (
     CaseStateError,
     Database,
@@ -176,6 +177,71 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                 "read_at",
             }.issubset({row["column_name"] for row in notification_columns})
         )
+
+    def test_cached_pool_supports_fresh_current_wrappers(self):
+        database_resources.get_postgres_pool.clear()
+        database_a = database_resources.get_database(TEST_DATABASE_URL)
+        database_b = database_resources.get_database(TEST_DATABASE_URL)
+        self.assertIsNot(database_a, database_b)
+        self.assertIs(database_a.pool, database_b.pool)
+        self.assertTrue(database_a.health_check())
+        self.assertTrue(hasattr(database_b, "get_arbitration_evidence"))
+        self.assertTrue(hasattr(database_b, "get_unread_notifications"))
+
+        run_id = uuid.uuid4().hex
+        case_id = None
+        try:
+            case_id, _a_token, _b_token = database_a.create_case(
+                f"{self.gate_run_prefix}_RESOURCE_LIFECYCLE_{run_id}"
+            )
+            type(self).gate_case_ids.add(case_id)
+            self.assertEqual(
+                database_b.get_case(case_id)["status"],
+                "COLLECTING",
+            )
+            database_a.save_statement(
+                case_id,
+                "A",
+                valid_statement("A", run_id),
+            )
+            database_b.save_statement(
+                case_id,
+                "B",
+                valid_statement("B", run_id),
+            )
+            reservation = database_a.claim_artifact(case_id, "DISPUTE_MAP")
+            self.assertIsNotNone(reservation)
+            database_a.complete_artifact(
+                case_id,
+                reservation,
+                "DISPUTE_MAP",
+                f"RESOURCE_MAP_{run_id}",
+            )
+            marker = f"RESOURCE_MESSAGE_{run_id}"
+            database_a.add_message(case_id, "A", marker)
+            self.assertEqual(
+                database_b.get_messages(case_id)[-1]["content"],
+                marker,
+            )
+
+            database_a.request_arbitration(case_id, "A")
+            evidence = database_b.confirm_arbitration(case_id, "B")
+            self.assertEqual(
+                database_a.get_arbitration_evidence(case_id)["evidence_hash"],
+                evidence["evidence_hash"],
+            )
+            notifications = database_b.get_unread_notifications(case_id, "A")
+            self.assertEqual(len(notifications), 1)
+            self.assertEqual(
+                notifications[0]["event_type"],
+                "ARBITRATION_ACCEPTED",
+            )
+
+            database_a.close()
+            self.assertTrue(database_b.health_check())
+        finally:
+            if case_id is not None:
+                self._cleanup_and_assert(case_id)
 
     def test_developer_scenarios_use_real_postgres_and_cleanup(self):
         scenarios = (
