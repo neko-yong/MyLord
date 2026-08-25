@@ -39,10 +39,24 @@ class DatabaseSecurityTests(unittest.TestCase):
 
     def test_final_artifact_and_checkpoints_have_unique_kinds(self):
         self.assertIn("FINAL_JUDGMENT", db.PUBLIC_ARTIFACT_KINDS)
+        self.assertIn("ARBITRATION_EVIDENCE", db.ARTIFACT_KINDS)
         self.assertEqual(
             db.CHECKPOINT_ARTIFACT_KINDS,
             {"JUDGMENT_NORMAL", "JUDGMENT_SWAPPED", "META_JUDGMENT"},
         )
+
+    def test_schema_supports_pending_arbitrating_and_evidence_hash(self):
+        schema = "\n".join(db.SCHEMA_STATEMENTS).lower()
+
+        self.assertIn("arbitration_pending", schema)
+        self.assertIn("arbitrating", schema)
+        self.assertIn("arbitration_requested_by", schema)
+        self.assertIn("arbitration_requested_at", schema)
+        self.assertIn("arbitration_started_at", schema)
+        self.assertIn("arbitration_evidence", schema)
+        self.assertIn("evidence_hash", schema)
+        self.assertNotIn("drop table", schema)
+        self.assertNotIn("truncate", schema)
 
     @patch("db.ConnectionPool")
     def test_pool_separates_acquire_and_connect_timeouts(self, pool_class):

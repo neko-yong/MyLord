@@ -1,28 +1,81 @@
 import unittest
 
 from arbitration import run_final_arbitration
-from db import DatabaseUnavailable
+from db import CaseStateError, DatabaseUnavailable
 from llm import LLMError, LLMResult
 
 
+EVIDENCE_HASH = "a" * 64
+EVIDENCE = {
+    "version": 1,
+    "created_at": "2026-08-25T12:00:00+00:00",
+    "case_id": "TEST-CASE",
+    "a_statement": "A statement",
+    "b_statement": "B statement",
+    "dispute_map": "dispute map",
+    "message_cutoff_id": 2,
+    "messages": [
+        {
+            "id": 1,
+            "sender": "A",
+            "content": "A shared message",
+            "created_at": "2026-08-25T12:01:00+00:00",
+        },
+        {
+            "id": 2,
+            "sender": "JUDGE",
+            "content": "Judge shared message",
+            "created_at": "2026-08-25T12:02:00+00:00",
+        },
+    ],
+    "requester": "A",
+    "confirmer": "B",
+}
+
+
 class FakeDatabase:
-    def __init__(self, checkpoints=None, final_failures=0):
+    def __init__(
+        self,
+        checkpoints=None,
+        final_failures=0,
+        checkpoint_hashes=None,
+    ):
         self.checkpoints = dict(checkpoints or {})
+        self.checkpoint_hashes = {
+            kind: EVIDENCE_HASH for kind in self.checkpoints
+        }
+        self.checkpoint_hashes.update(checkpoint_hashes or {})
         self.saved = []
         self.final_failures = final_failures
         self.final_attempts = 0
         self.final_content = None
+        self.evidence_reads = 0
+
+    def get_arbitration_evidence(self, _case_id):
+        self.evidence_reads += 1
+        return {
+            "snapshot": EVIDENCE,
+            "evidence_hash": EVIDENCE_HASH,
+        }
 
     def get_artifact(self, _case_id, kind):
         content = self.checkpoints.get(kind)
-        return {"content": content} if content is not None else None
+        return (
+            {
+                "content": content,
+                "evidence_hash": self.checkpoint_hashes.get(kind),
+            }
+            if content is not None
+            else None
+        )
 
-    def save_checkpoint(self, _case_id, kind, content):
+    def save_checkpoint(self, _case_id, kind, content, evidence_hash):
         existing = self.checkpoints.get(kind)
         if existing is not None and existing != content:
             raise AssertionError("checkpoint must remain unique")
         self.checkpoints[kind] = content
-        self.saved.append((kind, content))
+        self.checkpoint_hashes[kind] = evidence_hash
+        self.saved.append((kind, content, evidence_hash))
         return len(self.saved)
 
     def complete_artifact(
@@ -85,9 +138,6 @@ def run(database, llm, sleep=lambda _seconds: None):
         ask_llm=llm,
         case_id="TEST-CASE",
         reservation_id=99,
-        statements={"A": "A statement", "B": "B statement"},
-        dispute_content="dispute map",
-        history="shared history",
         dual_review=True,
         sleep=sleep,
     )
@@ -99,21 +149,30 @@ class ArbitrationCheckpointTests(unittest.TestCase):
 
         run(database, FakeLLM())
 
-        self.assertEqual(database.saved[0], ("JUDGMENT_NORMAL", "normal"))
+        self.assertEqual(
+            database.saved[0],
+            ("JUDGMENT_NORMAL", "normal", EVIDENCE_HASH),
+        )
 
     def test_swapped_judgment_is_checkpointed(self):
         database = FakeDatabase()
 
         run(database, FakeLLM())
 
-        self.assertEqual(database.saved[1], ("JUDGMENT_SWAPPED", "swapped"))
+        self.assertEqual(
+            database.saved[1],
+            ("JUDGMENT_SWAPPED", "swapped", EVIDENCE_HASH),
+        )
 
     def test_meta_judgment_is_checkpointed_before_finalization(self):
         database = FakeDatabase()
 
         run(database, FakeLLM())
 
-        self.assertEqual(database.saved[2], ("META_JUDGMENT", "meta"))
+        self.assertEqual(
+            database.saved[2],
+            ("META_JUDGMENT", "meta", EVIDENCE_HASH),
+        )
         self.assertEqual(database.final_content, "meta")
 
     def test_resume_from_normal_skips_first_llm_call(self):
@@ -172,6 +231,43 @@ class ArbitrationCheckpointTests(unittest.TestCase):
         run(database, llm)
 
         self.assertEqual([call[2] for call in llm.calls], [6000, 6000, 6000])
+
+    def test_all_stages_are_bound_to_same_evidence_hash(self):
+        database = FakeDatabase()
+
+        run(database, FakeLLM())
+
+        self.assertEqual(database.evidence_reads, 1)
+        self.assertEqual(
+            [saved[2] for saved in database.saved],
+            [EVIDENCE_HASH, EVIDENCE_HASH, EVIDENCE_HASH],
+        )
+
+    def test_normal_and_swapped_prompts_use_frozen_snapshot(self):
+        database = FakeDatabase()
+        llm = FakeLLM()
+
+        run(database, llm)
+
+        first_prompt = llm.calls[0][1]
+        second_prompt = llm.calls[1][1]
+        self.assertIn("===== A 独立陈述 =====\nA statement", first_prompt)
+        self.assertIn("===== B 独立陈述 =====\nB statement", first_prompt)
+        self.assertIn("A: A shared message", first_prompt)
+        self.assertIn("JUDGE: Judge shared message", first_prompt)
+        self.assertIn("===== 临时 A（原始 B）=====\nB statement", second_prompt)
+        self.assertIn("===== 临时 B（原始 A）=====\nA statement", second_prompt)
+        self.assertIn("A: A shared message", second_prompt)
+        self.assertNotIn("THIS_MUST_NOT_ENTER", first_prompt + second_prompt)
+
+    def test_resume_rejects_checkpoint_from_other_evidence(self):
+        database = FakeDatabase(
+            {"JUDGMENT_NORMAL": "saved normal"},
+            checkpoint_hashes={"JUDGMENT_NORMAL": "b" * 64},
+        )
+
+        with self.assertRaises(CaseStateError):
+            run(database, FakeLLM())
 
     def test_truncated_judgment_is_not_persisted(self):
         database = FakeDatabase()

@@ -1,6 +1,7 @@
 import time
 
-from db import DatabaseUnavailable
+from db import CaseStateError, DatabaseUnavailable
+from evidence import format_evidence_history
 from llm import TASK_MAX_TOKENS
 from prompts import FINAL_JUDGMENT_PROMPT, META_JUDGE_PROMPT
 
@@ -25,10 +26,13 @@ def _checkpoint_content(
     ask_llm,
     system_prompt,
     user_prompt,
+    evidence_hash,
     sleep,
 ):
     existing = database.get_artifact(case_id, kind)
     if existing and existing["content"]:
+        if existing.get("evidence_hash") != evidence_hash:
+            raise CaseStateError("仲裁检查点与冻结证据不一致。")
         return existing["content"]
 
     result = ask_llm(
@@ -37,7 +41,12 @@ def _checkpoint_content(
         max_tokens=TASK_MAX_TOKENS[kind],
     )
     retry_database_write(
-        lambda: database.save_checkpoint(case_id, kind, result.content),
+        lambda: database.save_checkpoint(
+            case_id,
+            kind,
+            result.content,
+            evidence_hash,
+        ),
         sleep=sleep,
     )
     return result.content
@@ -48,15 +57,20 @@ def run_final_arbitration(
     ask_llm,
     case_id,
     reservation_id,
-    statements,
-    dispute_content,
-    history,
     dual_review=True,
     sleep=time.sleep,
 ):
+    evidence_record = database.get_arbitration_evidence(case_id)
+    if not evidence_record:
+        raise CaseStateError("案件缺少冻结证据，不能开始最终仲裁。")
+    snapshot = evidence_record["snapshot"]
+    snapshot_hash = evidence_record["evidence_hash"]
+
     if dual_review:
         meta_checkpoint = database.get_artifact(case_id, "META_JUDGMENT")
         if meta_checkpoint and meta_checkpoint["content"]:
+            if meta_checkpoint.get("evidence_hash") != snapshot_hash:
+                raise CaseStateError("Meta 检查点与冻结证据不一致。")
             final_result = meta_checkpoint["content"]
             retry_database_write(
                 lambda: database.complete_artifact(
@@ -69,8 +83,10 @@ def run_final_arbitration(
             )
             return final_result
 
-    a = statements["A"]
-    b = statements["B"]
+    a = snapshot["a_statement"]
+    b = snapshot["b_statement"]
+    dispute_content = snapshot["dispute_map"]
+    history = format_evidence_history(snapshot)
     base = f"""===== A 独立陈述 =====
 {a}
 
@@ -90,6 +106,7 @@ def run_final_arbitration(
         ask_llm,
         FINAL_JUDGMENT_PROMPT,
         base + "\n\n" + FINAL_JUDGMENT_PROMPT,
+        snapshot_hash,
         sleep,
     )
 
@@ -120,6 +137,7 @@ def run_final_arbitration(
             ask_llm,
             FINAL_JUDGMENT_PROMPT,
             swapped,
+            snapshot_hash,
             sleep,
         )
 
@@ -144,6 +162,7 @@ def run_final_arbitration(
             ask_llm,
             META_JUDGE_PROMPT,
             meta,
+            snapshot_hash,
             sleep,
         )
 
