@@ -1,0 +1,213 @@
+# 双向关系仲裁员 V1
+
+一个可公网部署的双人关系调解 Streamlit 应用：
+
+```text
+独立陈述 → 争议地图 → 共享调解 → 暂停 / 恢复 → 双向复核仲裁
+```
+
+V1 使用 PostgreSQL 保存共享案件状态，A 与 B 可以从不同设备进入同一案件。LLM 配置只存在服务端，普通参与者不需要提供 Endpoint、Model 或 API Key。
+
+> 本项目用于关系调解与结构化分析，不是法律裁判。如果涉及现实的人身威胁、暴力或胁迫，应优先处理现实安全。
+
+## Architecture
+
+```text
+A browser ─┐
+           ├─ Public Streamlit app ─┬─ PostgreSQL / Supabase
+B browser ─┘                        └─ OpenAI-compatible LLM API
+```
+
+- PostgreSQL 是案件、陈述、消息、暂停状态与仲裁结果的唯一事实源。
+- `st.session_state` 只保存当前浏览器的 `case_id`、`role` 和登录状态。
+- A/B Token 使用 `secrets.token_urlsafe(24)` 生成；PostgreSQL 只保存 SHA-256 Hash。
+- 聊天室和案件状态使用 `st.fragment(run_every="2s")` 近实时读取，不使用 WebSocket。
+- LLM Key、数据库 URL 和管理员创建口令只从 Streamlit Secrets 或环境变量读取。
+
+## Features
+
+- 管理员创建口令限制新案件创建。
+- 创建时只展示一次 Case ID、A Token 与 B Token。
+- A/B 分别登录；失败提示不会区分案件不存在还是 Token 错误。
+- 独立陈述由 `UNIQUE(case_id, role)` 保证每人只能提交一次。
+- 参与者只看到自己的陈述正文和对方是否已提交。
+- 双方提交后生成一份共享争议地图。
+- 共享聊天、暂停与恢复状态写入 PostgreSQL，并每 2 秒同步。
+- AI 法官介入消息以 `JUDGE` 身份写入共享消息表。
+- 最终仲裁保留正常 A/B、交换标签与 Meta Judge 双向复核流程。
+- V1 每个案件只允许生成一份争议地图和一份最终仲裁，避免并发重复调用。
+- 生成前会用唯一占位预约避免重复模型调用；异常退出留下的空预约可在 15 分钟后自动重试。
+
+## Database schema
+
+应用首次连接时会用 `CREATE TABLE IF NOT EXISTS` 初始化：
+
+- `cases`: `case_id`, `title`, `a_token_hash`, `b_token_hash`, `status`, `paused_by`, timestamps
+- `statements`: 每个 `(case_id, role)` 唯一
+- `artifacts`: `DISPUTE_MAP` / `FINAL_JUDGMENT`，每个案件与类型唯一
+- `messages`: `A` / `B` / `JUDGE` / `SYSTEM` 共享消息
+
+状态机：
+
+```text
+COLLECTING
+→ READY_FOR_MAP
+→ MAP_READY
+→ MEDIATING
+↔ PAUSED
+→ CLOSED
+```
+
+旧的 `mediator.db` 不会自动迁移，也不会被 V1 生产代码读取。新部署从 PostgreSQL 空数据库开始。
+
+## Local development
+
+推荐本地也连接 Supabase PostgreSQL；项目不会在缺少 `DATABASE_URL` 时静默回落到 SQLite。
+
+### 1. Create the environment
+
+```powershell
+cd relationship_mediator_v01
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+### 2. Configure local secrets
+
+复制模板，但不要提交真实文件：
+
+```powershell
+Copy-Item .streamlit\secrets.toml.example .streamlit\secrets.toml
+```
+
+编辑 `.streamlit/secrets.toml`：
+
+```toml
+DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/DB"
+
+LLM_ENDPOINT = "https://your-provider.example/v1/chat/completions"
+LLM_MODEL = "your-model"
+LLM_API_KEY = "YOUR_API_KEY"
+
+ADMIN_CREATE_SECRET = "YOUR_ADMIN_CREATE_SECRET"
+DEVELOPMENT_MODE = true
+```
+
+同名环境变量也可用于本地开发；Streamlit Secrets 优先于环境变量。
+
+### 3. Run
+
+```powershell
+python -m streamlit run app.py
+```
+
+打开 `http://localhost:8501`。
+
+如果未设置 `DATABASE_URL`，应用会显示“数据库尚未配置”，不会建立本地数据库。LLM Secrets 未配置时仍可进入案件并完成双方独立陈述，但不能生成 AI 内容。
+
+# Public Deployment
+
+## 1. Create Supabase Project
+
+1. 登录 Supabase。
+2. 选择 **New project**，设置数据库密码和区域。
+3. 等待 PostgreSQL 项目创建完成。
+
+不需要启用 Supabase Auth 或 Storage；本项目只使用 PostgreSQL。
+
+## 2. Get PostgreSQL Connection String
+
+1. 在项目 Dashboard 点击 **Connect**。
+2. Streamlit 是持续运行的后端，优先复制 **Session pooler** connection string（通常是端口 `5432`，也适合仅 IPv4 的托管环境）。
+3. 用实际数据库密码替换连接串中的占位符，并保留控制台建议的 SSL 参数。
+
+如果使用 transaction-mode pooler（通常端口 `6543`），本项目已关闭 psycopg prepared statements 以保持兼容。
+
+不要把 connection string 写入源码、README 或 Git。
+
+## 3. Push Repository to GitHub
+
+确认以下文件不会进入提交：
+
+```text
+.streamlit/secrets.toml
+.env
+*.db
+```
+
+然后将项目代码推送到自己的 GitHub Repository。本仓库中的 `.streamlit/secrets.toml.example` 只有占位符，可以提交。
+
+## 4. Deploy on Streamlit Community Cloud
+
+1. 打开 Streamlit Community Cloud。
+2. 选择 **Create app**。
+3. 选择 GitHub repository、branch 和入口文件 `app.py`。
+4. 打开 **Advanced settings**。
+
+## 5. Configure Secrets
+
+在部署时的 **Advanced settings → Secrets**，或部署后的 **App settings → Secrets** 中填写：
+
+```toml
+DATABASE_URL = "postgresql://USER:PASSWORD@HOST:5432/DB"
+
+LLM_ENDPOINT = "https://your-provider.example/v1/chat/completions"
+LLM_MODEL = "your-model"
+LLM_API_KEY = "YOUR_API_KEY"
+
+ADMIN_CREATE_SECRET = "YOUR_ADMIN_CREATE_SECRET"
+DEVELOPMENT_MODE = false
+```
+
+不要把 `.streamlit/secrets.toml` 提交到 GitHub。公开部署保持 `DEVELOPMENT_MODE = false`，避免向普通用户显示技术诊断信息。
+
+## 6. Open Public URL
+
+部署成功后打开：
+
+```text
+https://your-app.streamlit.app
+```
+
+侧栏应显示数据库已连接；LLM 三项 Secret 齐全时显示 AI 法官已就绪。启动不会发起真实 LLM 请求或消耗 Token。
+
+## 7. Create Case
+
+在首页展开“创建新案件”，输入 `ADMIN_CREATE_SECRET` 和案件标题。立即保存：
+
+- Case ID
+- A Token
+- B Token
+
+服务器只保存 Token Hash，无法找回原始 Token。
+
+## 8. Send Partner
+
+只向 B 发送：
+
+```text
+Public URL
+Case ID
+B Token
+```
+
+A 保留 A Token。不要把 A/B 两个 Token 一起发送给同一个人。
+
+## Security notes
+
+- SQL 全部使用 psycopg 参数绑定。
+- API Key 不进入 URL、数据库、页面或日志。
+- 数据库 URL 和管理员创建口令不进入页面或数据库。
+- 技术错误详情默认关闭，且 LLM 响应会截断和移除认证内容。
+- 本项目没有端到端加密；数据库管理员和应用服务端可以访问调解内容。
+- V1 未实现登录速率限制。强随机 Token 降低猜测风险，但公网高流量部署仍应在反向代理或平台层增加 Rate Limit。
+
+## Tests
+
+```powershell
+python -m compileall -q -x "[\\/](\.venv|__pycache__)[\\/]" .
+python -m unittest discover -s tests -v
+```
+
+需要真实测试库时，先设置 `TEST_DATABASE_URL` 再运行测试。未配置时 PostgreSQL 集成测试会明确报告 `POSTGRES_REAL_TEST = NOT RUN`，不会伪造结果。

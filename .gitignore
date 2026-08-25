@@ -1,0 +1,9 @@
+.streamlit/secrets.toml
+.env
+.env.*
+__pycache__/
+*.pyc
+*.db
+.venv/
+.uv-cache/
+.idea/
