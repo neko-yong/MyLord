@@ -1,5 +1,7 @@
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from unittest.mock import patch
 
 from db import ADMIN_CASE_LINKED_TABLES, Database, DatabaseError
@@ -189,6 +191,56 @@ class AdminPostgresIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 graph_counts(self.database, target_case_id),
                 target_before,
+            )
+            self.assertEqual(
+                graph_counts(self.database, keep_case_id),
+                keep_before,
+            )
+        finally:
+            cleanup_cases(self.database, (target_case_id, keep_case_id))
+
+    def test_concurrent_delete_and_metadata_read_are_atomic(self):
+        target_case_id, keep_case_id = self._ids()
+        zero_counts = {table: 0 for table in ADMIN_CASE_LINKED_TABLES}
+        try:
+            insert_case_graph(self.database, target_case_id, "CONCURRENT")
+            insert_case_graph(self.database, keep_case_id, "CONCURRENT_KEEP")
+            target_before = graph_counts(self.database, target_case_id)
+            keep_before = graph_counts(self.database, keep_case_id)
+            barrier = Barrier(2)
+
+            def read_target():
+                barrier.wait()
+                metadata = self.database.get_case_admin_metadata(target_case_id)
+                counts = graph_counts(self.database, target_case_id)
+                return metadata, counts
+
+            def delete_target():
+                barrier.wait()
+                return self.database.delete_case_exact(target_case_id)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                read_future = executor.submit(read_target)
+                delete_future = executor.submit(delete_target)
+                metadata, observed_counts = read_future.result(timeout=30)
+                delete_result = delete_future.result(timeout=30)
+
+            self.assertEqual(delete_result["deleted_counts"], target_before)
+            self.assertEqual(delete_result["residual"], 0)
+            self.assertIn(observed_counts, (target_before, zero_counts))
+            if metadata is not None:
+                self.assertEqual(metadata["case_id"], target_case_id)
+                private_capture = repr(metadata)
+                for canary in (
+                    PRIVATE_STATEMENT,
+                    PRIVATE_MESSAGE,
+                    PRIVATE_JUDGMENT,
+                ):
+                    self.assertNotIn(canary, private_capture)
+
+            self.assertEqual(
+                graph_counts(self.database, target_case_id),
+                zero_counts,
             )
             self.assertEqual(
                 graph_counts(self.database, keep_case_id),
