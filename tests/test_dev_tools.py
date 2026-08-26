@@ -335,7 +335,14 @@ class DevScenarioTests(unittest.TestCase):
             )
         )
 
-        self.assertNotIn("query_params", source)
+        self.assertEqual(
+            [line.strip() for line in source.splitlines() if "query_params" in line],
+            [
+                "if is_admin_route("
+                "st.query_params, settings.admin_console_route_key"
+                "):"
+            ],
+        )
         self.assertNotIn("?dev=true", source.lower())
         self.assertNotIn("?debug=true", source.lower())
         self.assertNotIn("?database=local", source.lower())
@@ -357,8 +364,10 @@ class DevScenarioTests(unittest.TestCase):
             app_source.count(
                 "@st.fragment(run_every=AUTO_REFRESH_INTERVAL)"
             ),
-            4,
+            1,
         )
+        self.assertIn("database.get_case_revision(case_id, role)", app_source)
+        self.assertIn('@observe_fragment("mediation_room")', app_source)
         self.assertNotIn("@st.fragment(run_every=\"2s\")", app_source)
         self.assertNotIn("cache_resource", memory_source)
 

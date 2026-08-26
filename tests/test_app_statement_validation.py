@@ -12,6 +12,7 @@ def inline_dialog(*_args, **_kwargs):
 class FakeStatementDatabase:
     def __init__(self):
         self.saved = {}
+        self.snapshot_views = []
 
     def init_db(self):
         return None
@@ -48,6 +49,35 @@ class FakeStatementDatabase:
 
     def get_unread_notifications(self, _case_id, _role):
         return []
+
+    def get_case_revision(self, case_id, _role):
+        return {
+            "status": self.get_case(case_id)["status"],
+            "submitted": tuple(sorted(self.saved)),
+        }
+
+    def get_case_view_snapshot(
+        self,
+        case_id,
+        role,
+        view,
+        _last_message_id=0,
+    ):
+        self.snapshot_views.append(view)
+        return {
+            "case": self.get_case(case_id),
+            "submitted": self.get_case_overview(case_id)["submitted"],
+            "statement": (
+                self.get_statement(case_id, role)
+                if view == "statement"
+                else None
+            ),
+            "artifacts": {},
+            "evidence": None,
+            "messages": [],
+            "unread_notifications": [],
+            "revision": self.get_case_revision(case_id, role),
+        }
 
 
 def app_environment(database):
@@ -136,6 +166,19 @@ class StatementValidationUITests(unittest.TestCase):
         errors = "\n".join(str(element.value) for element in app.error)
         self.assertIn("还有必填内容没有完成", errors)
         self.assertIn("事情经过", errors)
+        self.assertEqual(database.saved, {})
+
+    def test_tabs_load_only_the_selected_page_snapshot(self):
+        database = FakeStatementDatabase()
+        app, patches = self.run_app(database)
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            app.run(timeout=15)
+            self.assertEqual(database.snapshot_views, ["statement"])
+            app.session_state["case_tab"] = "④ 最终仲裁"
+            app.run(timeout=15)
+
+        self.assertEqual(database.snapshot_views, ["statement", "final"])
         self.assertEqual(database.saved, {})
 
     def test_partial_submission_names_missing_field_and_does_not_save(self):

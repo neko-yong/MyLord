@@ -11,10 +11,13 @@ class Settings:
     llm_model: str
     llm_api_key: str = field(repr=False)
     admin_create_secret: str = field(repr=False)
+    admin_console_route_key: str = field(repr=False)
+    admin_maintenance_secret: str = field(repr=False)
     development_mode: bool = False
     dev_mode: bool = False
     llm_mode: str = "real"
     dev_database_mode: str = "postgres"
+    perf_debug: bool = False
 
     @property
     def llm_ready(self):
@@ -23,6 +26,12 @@ class Settings:
     @property
     def admin_create_ready(self):
         return bool(self.admin_create_secret)
+
+    @property
+    def admin_console_ready(self):
+        return bool(
+            self.admin_console_route_key and self.admin_maintenance_secret
+        )
 
 
 def _value(name, secrets_values, environ):
@@ -98,6 +107,16 @@ def load_settings(
         llm_model=_value("LLM_MODEL", secrets_values, environ),
         llm_api_key=_value("LLM_API_KEY", secrets_values, environ),
         admin_create_secret=_value("ADMIN_CREATE_SECRET", secrets_values, environ),
+        admin_console_route_key=_value(
+            "ADMIN_CONSOLE_ROUTE_KEY",
+            secrets_values,
+            environ,
+        ),
+        admin_maintenance_secret=_value(
+            "ADMIN_MAINTENANCE_SECRET",
+            secrets_values,
+            environ,
+        ),
         development_mode=_as_bool(
             _value("DEVELOPMENT_MODE", secrets_values, environ)
         ),
@@ -107,5 +126,9 @@ def load_settings(
             dev_mode,
             secrets_values,
             environ,
+        ),
+        perf_debug=_strict_bool(
+            "PERF_DEBUG",
+            _value("PERF_DEBUG", secrets_values, environ),
         ),
     )

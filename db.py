@@ -54,6 +54,15 @@ NOTIFICATION_EVENT_TYPES = {
 }
 MESSAGE_ALLOWED_STATUSES = {"MAP_READY", "MEDIATING", "ARBITRATION_PENDING"}
 ARBITRATION_REQUEST_ALLOWED_STATUSES = {"MAP_READY", "MEDIATING"}
+CASE_VIEW_NAMES = {"statement", "dispute", "mediation", "final"}
+ADMIN_CASE_LINKED_TABLES = (
+    "cases",
+    "statements",
+    "artifacts",
+    "messages",
+    "case_notifications",
+)
+MAX_ADMIN_CASE_ID_LENGTH = 128
 
 
 class DatabaseError(Exception):
@@ -266,6 +275,16 @@ def _validate_evidence_hash(value):
     return value.lower()
 
 
+def _exact_admin_case_id(case_id):
+    if not isinstance(case_id, str):
+        return None
+    if not case_id or case_id != case_id.strip():
+        return None
+    if len(case_id) > MAX_ADMIN_CASE_ID_LENGTH:
+        return None
+    return case_id
+
+
 def _evidence_record(row):
     if not row:
         return None
@@ -459,6 +478,107 @@ class Database:
 
         raise DatabaseUnavailable("无法生成唯一案件编号，请稍后重试。")
 
+    def list_case_metadata(self, limit=25, offset=0):
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 1
+            or limit > 100
+        ):
+            raise ValueError("limit 必须是 1 到 100 之间的整数。")
+        if (
+            not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+        ):
+            raise ValueError("offset 必须是非负整数。")
+
+        total_row = self._read_query("SELECT COUNT(*) AS count FROM cases")
+        rows = self._read_query(
+            """
+            SELECT case_id, status, created_at, updated_at
+            FROM cases
+            ORDER BY created_at DESC, case_id DESC
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+            fetch_all=True,
+        )
+        return {
+            "total": int(total_row["count"]),
+            "cases": [dict(row) for row in rows],
+        }
+
+    def get_case_admin_metadata(self, case_id):
+        exact_case_id = _exact_admin_case_id(case_id)
+        if exact_case_id is None:
+            return None
+        row = self._read_query(
+            """
+            SELECT case_id, status, created_at, updated_at
+            FROM cases
+            WHERE case_id = %s
+            """,
+            (exact_case_id,),
+        )
+        return dict(row) if row else None
+
+    def _admin_case_counts(self, connection, case_id):
+        row = connection.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM cases WHERE case_id = %s) AS cases,
+                (SELECT COUNT(*) FROM statements WHERE case_id = %s)
+                    AS statements,
+                (SELECT COUNT(*) FROM artifacts WHERE case_id = %s)
+                    AS artifacts,
+                (SELECT COUNT(*) FROM messages WHERE case_id = %s)
+                    AS messages,
+                (SELECT COUNT(*) FROM case_notifications WHERE case_id = %s)
+                    AS case_notifications
+            """,
+            (case_id, case_id, case_id, case_id, case_id),
+        ).fetchone()
+        return {
+            table: int(row[table])
+            for table in ADMIN_CASE_LINKED_TABLES
+        }
+
+    def delete_case_exact(self, case_id):
+        exact_case_id = _exact_admin_case_id(case_id)
+        if exact_case_id is None:
+            return None
+
+        with self._connection() as connection:
+            case = connection.execute(
+                "SELECT case_id FROM cases WHERE case_id = %s FOR UPDATE",
+                (exact_case_id,),
+            ).fetchone()
+            if not case:
+                return None
+
+            deleted_counts = self._admin_case_counts(
+                connection,
+                exact_case_id,
+            )
+            result = connection.execute(
+                "DELETE FROM cases WHERE case_id = %s",
+                (exact_case_id,),
+            )
+            residual_counts = self._admin_case_counts(
+                connection,
+                exact_case_id,
+            )
+            if result.rowcount != 1 or any(residual_counts.values()):
+                raise DatabaseError("案件删除验证失败，操作已回滚。")
+
+        return {
+            "case_id": exact_case_id,
+            "deleted_counts": deleted_counts,
+            "residual_counts": residual_counts,
+            "residual": sum(residual_counts.values()),
+        }
+
     def delete_case_if_title_prefix(self, case_id, title_prefix):
         if not isinstance(title_prefix, str) or not title_prefix:
             raise ValueError("案件标题前缀不能为空。")
@@ -569,6 +689,241 @@ class Database:
                 "A": row["a_submitted"],
                 "B": row["b_submitted"],
             },
+        }
+
+    def get_case_revision(self, case_id, role):
+        _validate_role(role)
+        row = self._read_query(
+            """
+            SELECT
+                c.status,
+                c.updated_at,
+                COALESCE(message_revision.latest_id, 0) AS latest_message_id,
+                COALESCE(artifact_revision.item_count, 0) AS artifact_count,
+                artifact_revision.latest_created_at AS latest_artifact_at,
+                artifact_revision.latest_failure_at AS latest_artifact_failure_at,
+                COALESCE(notification_revision.item_count, 0) AS unread_count,
+                COALESCE(notification_revision.first_id, 0) AS first_unread_id
+            FROM cases AS c
+            LEFT JOIN LATERAL (
+                SELECT MAX(id) AS latest_id
+                FROM messages
+                WHERE case_id = c.case_id
+            ) AS message_revision ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS item_count,
+                    MAX(created_at) AS latest_created_at,
+                    MAX(generation_failed_at) AS latest_failure_at
+                FROM artifacts
+                WHERE case_id = c.case_id
+            ) AS artifact_revision ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS item_count, MIN(id) AS first_id
+                FROM case_notifications
+                WHERE
+                    case_id = c.case_id
+                    AND recipient_role = %s
+                    AND read_at IS NULL
+            ) AS notification_revision ON TRUE
+            WHERE c.case_id = %s
+            """,
+            (role, case_id),
+        )
+        return self._case_revision(row)
+
+    def get_case_view_snapshot(
+        self,
+        case_id,
+        role,
+        view,
+        last_message_id=0,
+    ):
+        _validate_role(role)
+        if view not in CASE_VIEW_NAMES:
+            raise ValueError("无效的案件页面。")
+        if not isinstance(last_message_id, int) or last_message_id < 0:
+            raise ValueError("无效的消息游标。")
+        selected_kinds = {
+            "statement": (),
+            "dispute": ("DISPUTE_MAP",),
+            "mediation": ("DISPUTE_MAP",),
+            "final": tuple(sorted(ARTIFACT_KINDS)),
+        }[view]
+        row = self._read_query(
+            """
+            SELECT
+                c.case_id,
+                c.title,
+                c.status,
+                c.paused_by,
+                c.arbitration_requested_by,
+                c.arbitration_requested_at,
+                c.arbitration_started_at,
+                c.created_at,
+                c.updated_at,
+                EXISTS (
+                    SELECT 1 FROM statements AS submitted_a
+                    WHERE submitted_a.case_id = c.case_id
+                      AND submitted_a.role = 'A'
+                ) AS a_submitted,
+                EXISTS (
+                    SELECT 1 FROM statements AS submitted_b
+                    WHERE submitted_b.case_id = c.case_id
+                      AND submitted_b.role = 'B'
+                ) AS b_submitted,
+                own_statement.id AS statement_id,
+                own_statement.content AS statement_content,
+                own_statement.submitted_at AS statement_submitted_at,
+                COALESCE(artifact_data.items, '{}'::jsonb) AS artifacts,
+                COALESCE(artifact_data.item_count, 0) AS artifact_count,
+                artifact_data.latest_created_at AS latest_artifact_at,
+                artifact_data.latest_failure_at AS latest_artifact_failure_at,
+                COALESCE(message_data.items, '[]'::jsonb) AS messages,
+                COALESCE(message_data.latest_id, 0) AS latest_message_id,
+                notification_data.first_item AS unread_notification,
+                COALESCE(notification_data.item_count, 0) AS unread_count,
+                COALESCE(notification_data.first_id, 0) AS first_unread_id
+            FROM cases AS c
+            LEFT JOIN statements AS own_statement
+                ON own_statement.case_id = c.case_id
+               AND own_statement.role = %s
+               AND %s = 'statement'
+            LEFT JOIN LATERAL (
+                SELECT
+                    jsonb_object_agg(
+                        artifact.kind,
+                        jsonb_build_object(
+                            'id', artifact.id,
+                            'case_id', artifact.case_id,
+                            'kind', artifact.kind,
+                            'content', artifact.content,
+                            'evidence_hash', artifact.evidence_hash,
+                            'generation_failed_at', artifact.generation_failed_at,
+                            'created_at', artifact.created_at
+                        )
+                    ) FILTER (
+                        WHERE artifact.kind = ANY(%s)
+                           OR (
+                               c.status = 'READY_FOR_MAP'
+                               AND artifact.kind = 'DISPUTE_MAP'
+                           )
+                    ) AS items,
+                    COUNT(*) AS item_count,
+                    MAX(artifact.created_at) AS latest_created_at,
+                    MAX(artifact.generation_failed_at) AS latest_failure_at
+                FROM artifacts AS artifact
+                WHERE artifact.case_id = c.case_id
+            ) AS artifact_data ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    jsonb_agg(
+                        jsonb_build_object(
+                            'id', message.id,
+                            'case_id', message.case_id,
+                            'sender', message.sender,
+                            'content', message.content,
+                            'created_at', message.created_at
+                        )
+                        ORDER BY message.id
+                    ) FILTER (
+                        WHERE %s = 'mediation' AND message.id > %s
+                    ) AS items,
+                    MAX(message.id) AS latest_id
+                FROM messages AS message
+                WHERE message.case_id = c.case_id
+            ) AS message_data ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    (
+                        jsonb_agg(
+                            jsonb_build_object(
+                                'id', notification.id,
+                                'case_id', notification.case_id,
+                                'recipient_role', notification.recipient_role,
+                                'event_type', notification.event_type,
+                                'actor_role', notification.actor_role,
+                                'created_at', notification.created_at,
+                                'read_at', notification.read_at
+                            )
+                            ORDER BY notification.created_at, notification.id
+                        ) -> 0
+                    ) AS first_item,
+                    COUNT(*) AS item_count,
+                    MIN(notification.id) AS first_id
+                FROM case_notifications AS notification
+                WHERE
+                    notification.case_id = c.case_id
+                    AND notification.recipient_role = %s
+                    AND notification.read_at IS NULL
+            ) AS notification_data ON TRUE
+            WHERE c.case_id = %s
+            """,
+            (
+                role,
+                view,
+                list(selected_kinds),
+                view,
+                last_message_id,
+                role,
+                case_id,
+            ),
+        )
+        if not row:
+            return None
+
+        case = {
+            "case_id": row["case_id"],
+            "title": row["title"],
+            "status": row["status"],
+            "paused_by": row["paused_by"],
+            "arbitration_requested_by": row["arbitration_requested_by"],
+            "arbitration_requested_at": row["arbitration_requested_at"],
+            "arbitration_started_at": row["arbitration_started_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        statement = None
+        if row["statement_id"] is not None:
+            statement = {
+                "id": row["statement_id"],
+                "case_id": row["case_id"],
+                "role": role,
+                "content": row["statement_content"],
+                "submitted_at": row["statement_submitted_at"],
+            }
+        artifacts = row["artifacts"] or {}
+        evidence_row = artifacts.get("ARBITRATION_EVIDENCE")
+        notification = row["unread_notification"]
+        return {
+            "case": case,
+            "submitted": {
+                "A": row["a_submitted"],
+                "B": row["b_submitted"],
+            },
+            "statement": statement,
+            "artifacts": artifacts,
+            "evidence": _evidence_record(evidence_row),
+            "messages": row["messages"],
+            "unread_notifications": [notification] if notification else [],
+            "revision": self._case_revision(row),
+        }
+
+    @staticmethod
+    def _case_revision(row):
+        if not row:
+            return None
+        return {
+            "status": row["status"],
+            "updated_at": row["updated_at"],
+            "latest_message_id": row["latest_message_id"],
+            "artifact_count": row["artifact_count"],
+            "latest_artifact_at": row.get("latest_artifact_at"),
+            "latest_artifact_failure_at": row.get(
+                "latest_artifact_failure_at"
+            ),
+            "unread_count": row["unread_count"],
+            "first_unread_id": row["first_unread_id"],
         }
 
     def get_statement(self, case_id, role):
@@ -1333,35 +1688,47 @@ class Database:
             raise ValueError("消息不能为空。")
 
         with self._connection() as connection:
-            case = connection.execute(
-                "SELECT status FROM cases WHERE case_id = %s FOR UPDATE",
-                (case_id,),
+            message = connection.execute(
+                """
+                WITH eligible_case AS (
+                    UPDATE cases
+                    SET
+                        status = CASE
+                            WHEN status = 'MAP_READY' THEN 'MEDIATING'
+                            ELSE status
+                        END,
+                        updated_at = NOW()
+                    WHERE case_id = %s AND status = ANY(%s)
+                    RETURNING case_id, status, updated_at
+                ),
+                inserted_message AS (
+                    INSERT INTO messages(
+                        case_id,
+                        sender,
+                        content,
+                        created_at
+                    )
+                    SELECT case_id, %s, %s, NOW()
+                    FROM eligible_case
+                    RETURNING id, case_id, sender, content, created_at
+                )
+                SELECT
+                    inserted_message.*,
+                    eligible_case.status AS case_status,
+                    eligible_case.updated_at AS case_updated_at
+                FROM inserted_message
+                JOIN eligible_case USING (case_id)
+                """,
+                (
+                    case_id,
+                    list(MESSAGE_ALLOWED_STATUSES),
+                    sender,
+                    clean_content,
+                ),
             ).fetchone()
-            if not case or case["status"] not in MESSAGE_ALLOWED_STATUSES:
+            if not message:
                 raise CaseStateError("当前案件状态不允许发送新消息。")
-
-            connection.execute(
-                """
-                INSERT INTO messages(case_id, sender, content, created_at)
-                VALUES (%s, %s, %s, NOW())
-                """,
-                (case_id, sender, clean_content),
-            )
-            connection.execute(
-                """
-                UPDATE cases
-                SET
-                    status = CASE
-                        WHEN status = 'MAP_READY' THEN 'MEDIATING'
-                        WHEN status = 'ARBITRATION_PENDING'
-                            THEN 'ARBITRATION_PENDING'
-                        ELSE status
-                    END,
-                    updated_at = NOW()
-                WHERE case_id = %s
-                """,
-                (case_id,),
-            )
+            return message
 
     def ensure_judge_intervention_allowed(self, case_id):
         with self._connection() as connection:
