@@ -46,6 +46,17 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(settings.dev_mode)
         self.assertEqual(settings.llm_mode, "real")
         self.assertEqual(settings.dev_database_mode, "postgres")
+        self.assertFalse(settings.perf_debug)
+
+    def test_perf_debug_is_explicit_and_defaults_off(self):
+        self.assertTrue(
+            load_settings({"PERF_DEBUG": "true"}, {}).perf_debug
+        )
+        self.assertFalse(
+            load_settings({"PERF_DEBUG": "false"}, {}).perf_debug
+        )
+        with self.assertRaises(ValueError):
+            load_settings({"PERF_DEBUG": "enabled"}, {})
 
     def test_dev_mode_accepts_only_explicit_boolean_values(self):
         truthy = (True, 1, "1", "true", "TRUE", "yes", " YES ")

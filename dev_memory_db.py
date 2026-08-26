@@ -225,6 +225,162 @@ class DevMemoryDatabase:
             "submitted": self.get_submission_status(case_id),
         }
 
+    def get_case_revision(self, case_id, role):
+        self._guard()
+        _role(role)
+        case = self.store["cases"].get(case_id)
+        if not case:
+            return None
+        messages = self.store["messages"].get(case_id, [])
+        artifacts = [
+            artifact
+            for (artifact_case_id, _), artifact in self.store["artifacts"].items()
+            if artifact_case_id == case_id
+        ]
+        unread = [
+            notification
+            for notification in self.store["notifications"].values()
+            if notification["case_id"] == case_id
+            and notification["recipient_role"] == role
+            and notification["read_at"] is None
+        ]
+        return {
+            "status": case["status"],
+            "updated_at": case["updated_at"],
+            "latest_message_id": messages[-1]["id"] if messages else 0,
+            "artifact_count": len(artifacts),
+            "latest_artifact_at": max(
+                (artifact["created_at"] for artifact in artifacts),
+                default=None,
+            ),
+            "latest_artifact_failure_at": max(
+                (
+                    artifact.get("generation_failed_at")
+                    for artifact in artifacts
+                    if artifact.get("generation_failed_at") is not None
+                ),
+                default=None,
+            ),
+            "unread_count": len(unread),
+            "first_unread_id": min(
+                (notification["id"] for notification in unread),
+                default=0,
+            ),
+        }
+
+    def get_case_view_snapshot(
+        self,
+        case_id,
+        role,
+        view,
+        last_message_id=0,
+    ):
+        self._guard()
+        _role(role)
+        if view not in {"statement", "dispute", "mediation", "final"}:
+            raise ValueError("无效的案件页面。")
+        if not isinstance(last_message_id, int) or last_message_id < 0:
+            raise ValueError("无效的消息游标。")
+        case_record = self.store["cases"].get(case_id)
+        if not case_record:
+            return None
+        case = {
+            key: copy.deepcopy(value)
+            for key, value in case_record.items()
+            if key not in {"a_token_hash", "b_token_hash"}
+        }
+        selected_kinds = {
+            "statement": set(),
+            "dispute": {"DISPUTE_MAP"},
+            "mediation": {"DISPUTE_MAP"},
+            "final": {
+                "DISPUTE_MAP",
+                "FINAL_JUDGMENT",
+                "JUDGMENT_NORMAL",
+                "JUDGMENT_SWAPPED",
+                "META_JUDGMENT",
+                "ARBITRATION_EVIDENCE",
+            },
+        }[view]
+        if case["status"] == "READY_FOR_MAP":
+            selected_kinds.add("DISPUTE_MAP")
+        all_artifacts = [
+            artifact
+            for (artifact_case_id, _), artifact in self.store["artifacts"].items()
+            if artifact_case_id == case_id
+        ]
+        artifacts = {
+            artifact["kind"]: copy.deepcopy(artifact)
+            for artifact in all_artifacts
+            if artifact["kind"] in selected_kinds
+        }
+        all_messages = self.store["messages"].get(case_id, [])
+        messages = []
+        if view == "mediation":
+            messages = copy.deepcopy([
+                message
+                for message in all_messages
+                if message["id"] > last_message_id
+            ])
+        unread = [
+            notification
+            for notification in self.store["notifications"].values()
+            if notification["case_id"] == case_id
+            and notification["recipient_role"] == role
+            and notification["read_at"] is None
+        ]
+        unread.sort(key=lambda item: (item["created_at"], item["id"]))
+        evidence = (
+            self.get_arbitration_evidence(case_id)
+            if "ARBITRATION_EVIDENCE" in artifacts
+            else None
+        )
+        return {
+            "case": case,
+            "submitted": {
+                submitted_role: (case_id, submitted_role)
+                in self.store["statements"]
+                for submitted_role in ("A", "B")
+            },
+            "statement": (
+                copy.deepcopy(self.store["statements"].get((case_id, role)))
+                if view == "statement"
+                else None
+            ),
+            "artifacts": artifacts,
+            "evidence": evidence,
+            "messages": messages,
+            "unread_notifications": copy.deepcopy(unread[:1]),
+            "revision": {
+                "status": case["status"],
+                "updated_at": case["updated_at"],
+                "latest_message_id": (
+                    all_messages[-1]["id"] if all_messages else 0
+                ),
+                "artifact_count": len(all_artifacts),
+                "latest_artifact_at": max(
+                    (
+                        artifact["created_at"]
+                        for artifact in all_artifacts
+                    ),
+                    default=None,
+                ),
+                "latest_artifact_failure_at": max(
+                    (
+                        artifact.get("generation_failed_at")
+                        for artifact in all_artifacts
+                        if artifact.get("generation_failed_at") is not None
+                    ),
+                    default=None,
+                ),
+                "unread_count": len(unread),
+                "first_unread_id": min(
+                    (notification["id"] for notification in unread),
+                    default=0,
+                ),
+            },
+        }
+
     def get_statement(self, case_id, role):
         self._guard()
         _role(role)
@@ -611,6 +767,10 @@ class DevMemoryDatabase:
         if case["status"] == "MAP_READY":
             case["status"] = "MEDIATING"
         self._touch(case)
+        result = copy.deepcopy(message)
+        result["case_status"] = case["status"]
+        result["case_updated_at"] = case["updated_at"]
+        return result
 
     def ensure_judge_intervention_allowed(self, case_id):
         self._guard()

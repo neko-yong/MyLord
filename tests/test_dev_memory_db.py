@@ -368,6 +368,86 @@ class DevMemoryDatabaseTests(unittest.TestCase):
             "Recovered map",
         )
 
+    def test_case_view_snapshot_is_page_scoped_and_message_incremental(self):
+        dev_case = seed_dev_case(
+            LOCAL_SETTINGS,
+            self.database,
+            "weekend_plan",
+            "MEDIATING",
+        )
+        case_id = dev_case.case_id
+
+        initial = self.database.get_case_view_snapshot(
+            case_id,
+            "A",
+            "mediation",
+        )
+        self.assertIsNone(initial["statement"])
+        self.assertEqual(set(initial["artifacts"]), {"DISPUTE_MAP"})
+        self.assertTrue(initial["messages"])
+        cursor = initial["messages"][-1]["id"]
+        revision = initial["revision"]
+
+        self.database.add_message(case_id, "B", "cross-client message")
+        changed = self.database.get_case_revision(case_id, "A")
+        self.assertNotEqual(changed, revision)
+        incremental = self.database.get_case_view_snapshot(
+            case_id,
+            "A",
+            "mediation",
+            cursor,
+        )
+        self.assertEqual(len(incremental["messages"]), 1)
+        self.assertEqual(
+            incremental["messages"][0]["content"],
+            "cross-client message",
+        )
+
+    def test_snapshot_revision_tracks_notification_ack_and_frozen_evidence(self):
+        dev_case = seed_dev_case(
+            LOCAL_SETTINGS,
+            self.database,
+            "weekend_plan",
+            "MEDIATING",
+        )
+        case_id = dev_case.case_id
+        self.database.request_arbitration(case_id, "A")
+        self.database.cancel_arbitration_request(case_id, "B")
+
+        unread = self.database.get_case_view_snapshot(
+            case_id,
+            "A",
+            "final",
+        )
+        notification = unread["unread_notifications"][0]
+        self.assertEqual(unread["revision"]["unread_count"], 1)
+        self.assertTrue(
+            self.database.mark_notification_read(
+                case_id,
+                notification["id"],
+                "A",
+            )
+        )
+        acknowledged = self.database.get_case_revision(case_id, "A")
+        self.assertEqual(acknowledged["unread_count"], 0)
+        self.assertNotEqual(acknowledged, unread["revision"])
+
+        self.database.request_arbitration(case_id, "A")
+        self.database.confirm_arbitration(case_id, "B")
+        frozen = self.database.get_case_view_snapshot(
+            case_id,
+            "A",
+            "final",
+        )
+        self.assertIsNone(frozen["statement"])
+        self.assertEqual(frozen["messages"], [])
+        self.assertIn("DISPUTE_MAP", frozen["artifacts"])
+        self.assertIn("ARBITRATION_EVIDENCE", frozen["artifacts"])
+        self.assertEqual(
+            frozen["evidence"]["snapshot"]["case_id"],
+            case_id,
+        )
+
     def test_arbitration_notifications_are_recipient_scoped_and_acknowledged(self):
         dev_case = seed_dev_case(
             LOCAL_SETTINGS,
