@@ -5,14 +5,6 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 
-TAB_LABELS = {
-    "① 独立陈述",
-    "② 争议地图",
-    "③ 调解室",
-    "④ 最终仲裁",
-}
-
-
 def inline_dialog(*_args, **_kwargs):
     return lambda function: function
 
@@ -131,6 +123,53 @@ class FakeDatabase:
             and notification["read_at"] is None
         ]
 
+    def get_case_revision(self, case_id, role):
+        unread = self.get_unread_notifications(case_id, role)
+        return {
+            "status": self.status,
+            "requester": self.requester,
+            "unread_count": len(unread),
+            "first_unread_id": unread[0]["id"] if unread else 0,
+        }
+
+    def get_case_view_snapshot(
+        self,
+        case_id,
+        role,
+        view,
+        _last_message_id=0,
+    ):
+        artifacts = {}
+        if view in {"dispute", "mediation", "final"}:
+            dispute = self.get_artifact(case_id, "DISPUTE_MAP")
+            if dispute:
+                artifacts["DISPUTE_MAP"] = dispute
+        if view == "final":
+            final_artifact = self.get_artifact(case_id, "FINAL_JUDGMENT")
+            if final_artifact:
+                artifacts["FINAL_JUDGMENT"] = final_artifact
+        return {
+            "case": self.get_case(case_id),
+            "submitted": {"A": True, "B": True},
+            "statement": (
+                self.get_statement(case_id, role)
+                if view == "statement"
+                else None
+            ),
+            "artifacts": artifacts,
+            "evidence": (
+                self.get_arbitration_evidence(case_id)
+                if view == "final"
+                else None
+            ),
+            "messages": [],
+            "unread_notifications": self.get_unread_notifications(
+                case_id,
+                role,
+            )[:1],
+            "revision": self.get_case_revision(case_id, role),
+        }
+
     def mark_notification_read(self, _case_id, notification_id, role):
         for notification in self.notifications:
             if (
@@ -144,13 +183,7 @@ class FakeDatabase:
 
 
 def select_tab(app, label):
-    tab_key = next(
-        key
-        for key in app.session_state._state._keys()
-        if isinstance(app.session_state[key], str)
-        and app.session_state[key] in TAB_LABELS
-    )
-    app.session_state[tab_key] = label
+    app.session_state["case_tab"] = label
     return app.run(timeout=15)
 
 

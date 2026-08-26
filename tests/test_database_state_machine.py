@@ -167,20 +167,30 @@ class ArbitrationStateMachineTests(unittest.TestCase):
 
     def test_pending_message_is_allowed_without_cancelling_request(self):
         database, connection = database_with(
-            Result(row={"status": "ARBITRATION_PENDING"}),
-            Result(),
-            Result(),
+            Result(
+                row={
+                    "id": 1,
+                    "case_id": "CASE-TEST",
+                    "sender": "A",
+                    "content": "pending message",
+                    "created_at": "now",
+                    "case_status": "ARBITRATION_PENDING",
+                    "case_updated_at": "now",
+                }
+            ),
         )
 
-        database.add_message("CASE-TEST", "A", "pending message")
+        message = database.add_message("CASE-TEST", "A", "pending message")
 
-        update_sql = connection.calls[-1][0]
-        self.assertIn("ARBITRATION_PENDING", update_sql)
+        self.assertEqual(message["id"], 1)
+        self.assertEqual(len(connection.calls), 1)
+        self.assertIn("WITH eligible_case", connection.calls[0][0])
+        self.assertIn("status = ANY", connection.calls[0][0])
 
     def test_arbitrating_and_closed_messages_are_rejected(self):
         for status in ("ARBITRATING", "CLOSED"):
             with self.subTest(status=status):
-                database, _connection = database_with(Result(row={"status": status}))
+                database, _connection = database_with(Result(row=None))
                 with self.assertRaises(CaseStateError):
                     database.add_message("CASE-TEST", "B", "forbidden")
 

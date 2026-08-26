@@ -15,6 +15,7 @@ class Settings:
     dev_mode: bool = False
     llm_mode: str = "real"
     dev_database_mode: str = "postgres"
+    perf_debug: bool = False
 
     @property
     def llm_ready(self):
@@ -107,5 +108,9 @@ def load_settings(
             dev_mode,
             secrets_values,
             environ,
+        ),
+        perf_debug=_strict_bool(
+            "PERF_DEBUG",
+            _value("PERF_DEBUG", secrets_values, environ),
         ),
     )

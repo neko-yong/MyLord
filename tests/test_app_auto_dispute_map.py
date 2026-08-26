@@ -41,6 +41,47 @@ class AutoMapDatabase:
     def get_unread_notifications(self, _case_id, _role):
         return []
 
+    def get_case_revision(self, case_id, _role):
+        artifact_state = None
+        if self.artifact:
+            artifact_state = (
+                self.artifact.get("id"),
+                self.artifact.get("content"),
+                self.artifact.get("generation_failed_at"),
+            )
+        return {
+            "status": self.get_case(case_id)["status"],
+            "artifact": artifact_state,
+        }
+
+    def get_case_view_snapshot(
+        self,
+        case_id,
+        role,
+        view,
+        _last_message_id=0,
+    ):
+        artifacts = {}
+        if self.artifact and (
+            view in {"dispute", "mediation", "final"}
+            or self.status == "READY_FOR_MAP"
+        ):
+            artifacts["DISPUTE_MAP"] = self.artifact
+        return {
+            "case": self.get_case(case_id),
+            "submitted": {"A": True, "B": True},
+            "statement": (
+                self.get_statement(case_id, role)
+                if view == "statement"
+                else None
+            ),
+            "artifacts": artifacts,
+            "evidence": None,
+            "messages": [],
+            "unread_notifications": [],
+            "revision": self.get_case_revision(case_id, role),
+        }
+
     def get_statement(self, _case_id, role):
         return {"content": f"{role} private statement"}
 

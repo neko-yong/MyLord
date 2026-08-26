@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-from functools import wraps
 
 import streamlit as st
 
@@ -28,6 +27,14 @@ from dev_tools import (
 )
 from llm import LLMError, TASK_MAX_TOKENS, call_llm
 from mock_llm import MockLLM
+from performance import (
+    finish_current_trace,
+    finish_trace,
+    instrument_database,
+    observe_fragment as measure_fragment,
+    record_llm_call,
+    start_trace,
+)
 from prompts import (
     CORE_SYSTEM_PROMPT,
     DISPUTE_MAP_PROMPT,
@@ -53,6 +60,13 @@ STATUS_LABELS = {
     "ARBITRATING": "最终仲裁进行中",
     "CLOSED": "最终仲裁已完成",
 }
+TAB_LABELS = (
+    "① 独立陈述",
+    "② 争议地图",
+    "③ 调解室",
+    "④ 最终仲裁",
+)
+TAB_VIEWS = dict(zip(TAB_LABELS, ("statement", "dispute", "mediation", "final")))
 
 
 logger = logging.getLogger(__name__)
@@ -230,19 +244,13 @@ def finish_dispute_map_generation(case_id, reservation_id):
     return True
 
 
-def render_automatic_dispute_map(case_id, current_case, submitted):
+def render_automatic_dispute_map(case_id, current_case, submitted, dispute):
     if not (submitted["A"] and submitted["B"]):
         return
     if current_case["status"] != "READY_FOR_MAP":
         return
 
     st.success("双方独立陈述已提交并冻结。", icon=":material/check_circle:")
-    try:
-        dispute = database.get_artifact(case_id, "DISPUTE_MAP")
-    except DatabaseError as error:
-        show_database_error(error)
-        return
-
     if dispute and dispute["content"]:
         return
     if dispute and dispute.get("generation_failed_at"):
@@ -266,7 +274,7 @@ def render_automatic_dispute_map(case_id, current_case, submitted):
                 st.info("另一请求已经开始重试，请稍后查看。")
                 return
             if finish_dispute_map_generation(case_id, reservation_id):
-                st.rerun()
+                rerun()
         return
     if dispute:
         st.info(
@@ -290,7 +298,7 @@ def render_automatic_dispute_map(case_id, current_case, submitted):
         )
         return
     if finish_dispute_map_generation(case_id, reservation_id):
-        st.rerun()
+        rerun()
 
 
 def run_judge_intervention(case_id):
@@ -418,6 +426,7 @@ def execute_confirmed_action(pending):
     dismissible=False,
     icon=":material/warning:",
 )
+@measure_fragment("confirmation_dialog", lambda: settings.perf_debug)
 def confirmation_dialog(pending):
     copy = CONFIRMATION_COPY[pending["action"]]
     st.markdown(f"### {copy['heading']}")
@@ -435,7 +444,7 @@ def confirmation_dialog(pending):
         )
     if cancel:
         clear_pending_confirmation()
-        st.rerun()
+        rerun()
     if not confirm:
         return
 
@@ -444,7 +453,7 @@ def confirmation_dialog(pending):
     except StatementAlreadySubmitted:
         clear_pending_confirmation()
         st.session_state["_interaction_notice"] = "独立陈述已经提交并冻结。"
-        st.rerun()
+        rerun()
     except CaseStateError as error:
         st.warning(str(error))
     except DatabaseError as error:
@@ -453,7 +462,7 @@ def confirmation_dialog(pending):
         show_llm_error(error)
     else:
         clear_pending_confirmation()
-        st.rerun()
+        rerun()
 
 
 def render_pending_confirmation(case_id, role):
@@ -476,6 +485,7 @@ def render_pending_confirmation(case_id, role):
     dismissible=False,
     icon=":material/notifications:",
 )
+@measure_fragment("notification_dialog", lambda: settings.perf_debug)
 def notification_dialog(notification, case_id, role):
     actor = notification["actor_role"]
     if notification["event_type"] == "ARBITRATION_ACCEPTED":
@@ -507,7 +517,7 @@ def notification_dialog(notification, case_id, role):
         except DatabaseError as error:
             show_database_error(error)
         else:
-            st.rerun()
+            rerun()
 
 
 def ask(
@@ -516,30 +526,39 @@ def ask(
     temperature=0.2,
     max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
 ):
-    if selected_llm_mode() == "mock":
-        result = active_mock_llm()(
-            system_extra,
-            user_text,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-    else:
-        if settings.dev_mode and not st.session_state.get(
-            "dev_real_llm_confirmed",
-            False,
-        ):
-            raise LLMError(
-                "dev_real_confirmation",
-                "Real LLM use requires developer confirmation.",
+    llm_mode = selected_llm_mode()
+    started = time.perf_counter()
+    try:
+        if llm_mode == "mock":
+            result = active_mock_llm()(
+                system_extra,
+                user_text,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
-        result = call_llm(
-            endpoint=settings.llm_endpoint,
-            model=settings.llm_model,
-            api_key=settings.llm_api_key,
-            system_prompt=CORE_SYSTEM_PROMPT + "\n\n" + system_extra,
-            user_prompt=user_text,
-            temperature=temperature,
-            max_tokens=max_tokens,
+        else:
+            if settings.dev_mode and not st.session_state.get(
+                "dev_real_llm_confirmed",
+                False,
+            ):
+                raise LLMError(
+                    "dev_real_confirmation",
+                    "Real LLM use requires developer confirmation.",
+                )
+            result = call_llm(
+                endpoint=settings.llm_endpoint,
+                model=settings.llm_model,
+                api_key=settings.llm_api_key,
+                system_prompt=CORE_SYSTEM_PROMPT + "\n\n" + system_extra,
+                user_prompt=user_text,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+    finally:
+        record_llm_call(
+            llm_mode,
+            (time.perf_counter() - started) * 1000,
+            "ask",
         )
     logger.info(
         "llm_result model=%s finish_reason=%s prompt_tokens=%s "
@@ -555,44 +574,21 @@ def ask(
 
 
 def observe_fragment(name):
-    def decorator(function):
-        @wraps(function)
-        def wrapped(*args, **kwargs):
-            if not (
-                settings.development_mode
-                or os.environ.get("REALTIME_GATE_OBSERVE") == "true"
-            ):
-                return function(*args, **kwargs)
+    enabled = (
+        settings.perf_debug
+        or settings.development_mode
+        or os.environ.get("REALTIME_GATE_OBSERVE") == "true"
+    )
+    return measure_fragment(name, enabled)
 
-            started = time.perf_counter()
-            state_key = f"_fragment_started_{name}"
-            previous = st.session_state.get(state_key)
-            st.session_state[state_key] = started
-            try:
-                return function(*args, **kwargs)
-            finally:
-                duration_ms = (time.perf_counter() - started) * 1000
-                interval_ms = (
-                    (started - previous) * 1000
-                    if previous is not None
-                    else None
-                )
-                logger.log(
-                    logging.WARNING
-                    if os.environ.get("REALTIME_GATE_OBSERVE") == "true"
-                    else logging.INFO,
-                    "fragment_timing name=%s interval_ms=%s duration_ms=%.2f",
-                    name,
-                    f"{interval_ms:.2f}" if interval_ms is not None else "first",
-                    duration_ms,
-                )
 
-        return wrapped
-
-    return decorator
+def rerun(scope="app"):
+    finish_current_trace()
+    st.rerun(scope=scope)
 
 
 settings = _load_server_settings()
+performance_trace = start_trace(settings.perf_debug, "full_rerun", "app")
 st.session_state.setdefault("auth", None)
 if settings.dev_mode:
     st.session_state.setdefault(
@@ -798,7 +794,7 @@ def render_developer_playground():
             database.reset()
             clear_dev_case_state()
             st.session_state._dev_reset_pending = True
-            st.rerun()
+            rerun()
 
         if st.button(
             "创建测试案件",
@@ -833,7 +829,7 @@ def render_developer_playground():
                         "triggered": False,
                         "attempts": 0,
                     }
-                    st.rerun()
+                    rerun()
 
         dev_case = active_dev_case()
         if not dev_case:
@@ -896,7 +892,7 @@ def render_developer_playground():
                 icon=":material/refresh:",
                 key="dev_refresh",
             ):
-                st.rerun()
+                rerun()
             if st.button(
                 "重新创建相同场景",
                 icon=":material/replay:",
@@ -923,7 +919,7 @@ def render_developer_playground():
                         "triggered": False,
                         "attempts": 0,
                     }
-                    st.rerun()
+                    rerun()
 
         if st.button(
             "删除当前测试案件",
@@ -937,7 +933,7 @@ def render_developer_playground():
                 st.error(str(error))
             else:
                 clear_dev_case_state()
-                st.rerun()
+                rerun()
 
 
 def current_auth():
@@ -994,6 +990,8 @@ else:
         show_database_error(error)
         st.stop()
 
+database = instrument_database(database, settings.perf_debug)
+
 render_developer_playground()
 auth = current_auth()
 
@@ -1017,7 +1015,7 @@ with service_status:
                 clear_dev_case_state()
             else:
                 st.session_state.auth = None
-            st.rerun()
+            rerun()
 
 
 if not auth:
@@ -1054,7 +1052,7 @@ if not auth:
                         "case_id": login_case_id.strip().upper(),
                         "role": role,
                     }
-                    st.rerun()
+                    rerun()
 
     create_expander = st.expander(
         "创建新案件",
@@ -1124,13 +1122,33 @@ if role not in {"A", "B"}:
     st.error("当前登录状态无效，请重新进入案件。")
     st.stop()
 
+selected_tab = st.session_state.get("case_tab", TAB_LABELS[0])
+if selected_tab not in TAB_VIEWS:
+    selected_tab = TAB_LABELS[0]
+    st.session_state["case_tab"] = selected_tab
+selected_view = TAB_VIEWS[selected_tab]
+message_cache_key = f"_message_cache_{case_id}"
+cached_messages = st.session_state.get(message_cache_key, [])
+if not isinstance(cached_messages, list):
+    cached_messages = []
+last_message_id = (
+    cached_messages[-1]["id"]
+    if selected_view == "mediation" and cached_messages
+    else 0
+)
+
 try:
-    case = database.get_case(case_id)
+    page_snapshot = database.get_case_view_snapshot(
+        case_id,
+        role,
+        selected_view,
+        last_message_id,
+    )
 except DatabaseError as error:
     show_database_error(error)
     st.stop()
 
-if not case:
+if not page_snapshot:
     if auth.get("dev"):
         clear_dev_case_state()
     else:
@@ -1138,72 +1156,79 @@ if not case:
     st.error("案件不存在或已不可用，请重新进入。")
     st.stop()
 
+case = page_snapshot["case"]
 other = "B" if role == "A" else "A"
 st.subheader(case["title"])
 if interaction_notice := st.session_state.pop("_interaction_notice", None):
     st.warning(interaction_notice)
 
 render_pending_confirmation(case_id, role)
+if (
+    not st.session_state.get("_pending_confirmation")
+    and page_snapshot["unread_notifications"]
+):
+    notification_dialog(
+        page_snapshot["unread_notifications"][0],
+        case_id,
+        role,
+    )
+
+submitted = page_snapshot["submitted"]
+label = STATUS_LABELS.get(case["status"], case["status"])
+st.markdown(f"**案件状态：** {label}")
+with st.container(horizontal=True):
+    st.badge(
+        "A 已提交" if submitted["A"] else "A 待提交",
+        color="green" if submitted["A"] else "gray",
+    )
+    st.badge(
+        "B 已提交" if submitted["B"] else "B 待提交",
+        color="green" if submitted["B"] else "gray",
+    )
+if database_mode == "local":
+    st.caption(
+        "Fast Local 通过当前 Session 的页面操作刷新状态；"
+        "对方的独立陈述正文不会显示。"
+    )
+else:
+    st.caption("页面每 2 秒同步案件状态；对方的独立陈述正文不会显示。")
+render_automatic_dispute_map(
+    case_id,
+    case,
+    submitted,
+    page_snapshot["artifacts"].get("DISPUTE_MAP"),
+)
+
+revision_key = f"_case_revision_{case_id}_{role}"
+st.session_state[revision_key] = page_snapshot["revision"]
+sync_skip_key = f"_skip_case_sync_{case_id}_{role}"
+st.session_state[sync_skip_key] = True
 
 
 @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
-@observe_fragment("case_notifications")
-def live_case_notifications():
-    if st.session_state.get("_pending_confirmation"):
+@observe_fragment("case_sync")
+def live_case_sync():
+    if st.session_state.pop(sync_skip_key, False):
         return
     try:
-        unread = database.get_unread_notifications(case_id, role)
+        fresh_revision = database.get_case_revision(case_id, role)
     except DatabaseError as error:
         show_database_error(error)
         return
-    if unread:
-        notification_dialog(unread[0], case_id, role)
+    if fresh_revision != st.session_state.get(revision_key):
+        rerun()
 
 
-live_case_notifications()
+live_case_sync()
 
-
-@st.fragment(run_every=AUTO_REFRESH_INTERVAL)
-@observe_fragment("case_overview")
-def live_case_overview():
-    try:
-        snapshot = database.get_case_overview(case_id)
-    except DatabaseError as error:
-        show_database_error(error)
-        return
-
-    if not snapshot:
-        st.error("案件已不可用。")
-        return
-
-    current_case = snapshot["case"]
-    submitted = snapshot["submitted"]
-
-    label = STATUS_LABELS.get(current_case["status"], current_case["status"])
-    st.markdown(f"**案件状态：** {label}")
-    with st.container(horizontal=True):
-        st.badge(
-            "A 已提交" if submitted["A"] else "A 待提交",
-            color="green" if submitted["A"] else "gray",
-        )
-        st.badge(
-            "B 已提交" if submitted["B"] else "B 待提交",
-            color="green" if submitted["B"] else "gray",
-        )
-    if database_mode == "local":
-        st.caption(
-            "Fast Local 通过当前 Session 的页面操作刷新状态；"
-            "对方的独立陈述正文不会显示。"
-        )
-    else:
-        st.caption("页面每 2 秒同步案件状态；对方的独立陈述正文不会显示。")
-    render_automatic_dispute_map(case_id, current_case, submitted)
-
-
-live_case_overview()
+if selected_view == "mediation":
+    st.session_state[message_cache_key] = (
+        cached_messages + page_snapshot["messages"]
+    )
 
 tabs = st.tabs(
-    ["① 独立陈述", "② 争议地图", "③ 调解室", "④ 最终仲裁"],
+    TAB_LABELS,
+    key="case_tab",
     on_change="rerun",
 )
 
@@ -1212,11 +1237,7 @@ if tabs[0].open:
         st.markdown("### 你的独立陈述")
         st.caption("这一阶段互相不可见。提交后冻结，避免看到对方版本后修改自己的叙述。")
 
-        try:
-            my_statement = database.get_statement(case_id, role)
-        except DatabaseError as error:
-            show_database_error(error)
-            my_statement = None
+        my_statement = page_snapshot["statement"]
 
         if my_statement:
             st.success("你已经提交，当前版本已冻结。")
@@ -1280,7 +1301,7 @@ if tabs[0].open:
                         role,
                         {"content": content},
                     )
-                    st.rerun()
+                    rerun()
 
         st.info(
             f"你只能看到自己的陈述正文。页面顶部会同步 {other} 是否已经提交。",
@@ -1290,13 +1311,8 @@ if tabs[0].open:
 if tabs[1].open:
     with tabs[1]:
         st.markdown("### 争议地图")
-        try:
-            submission_status = database.get_submission_status(case_id)
-            dispute = database.get_artifact(case_id, "DISPUTE_MAP")
-        except DatabaseError as error:
-            show_database_error(error)
-            submission_status = {"A": False, "B": False}
-            dispute = None
+        submission_status = page_snapshot["submitted"]
+        dispute = page_snapshot["artifacts"].get("DISPUTE_MAP")
 
         if dispute and dispute["content"]:
             st.markdown(dispute["content"])
@@ -1319,34 +1335,12 @@ if tabs[2].open:
     with tabs[2]:
         st.markdown("### 共享调解室")
 
-        @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
+        @st.fragment
         @observe_fragment("mediation_room")
         def shared_mediation_room():
-            message_cache_key = f"_message_cache_{case_id}"
-            cached_messages = st.session_state.get(message_cache_key, [])
-            if not isinstance(cached_messages, list):
-                cached_messages = []
-            last_message_id = (
-                cached_messages[-1]["id"] if cached_messages else 0
-            )
-
-            try:
-                snapshot = database.get_mediation_snapshot(
-                    case_id,
-                    last_message_id,
-                )
-            except DatabaseError as error:
-                show_database_error(error)
-                return
-
-            if not snapshot:
-                st.error("案件已不可用。")
-                return
-
-            current_case = snapshot["case"]
-            dispute = snapshot["artifact"]
-            messages = cached_messages + snapshot["messages"]
-            st.session_state[message_cache_key] = messages
+            current_case = page_snapshot["case"]
+            dispute = page_snapshot["artifacts"].get("DISPUTE_MAP")
+            messages = st.session_state.get(message_cache_key, [])
 
             if not dispute or not dispute["content"]:
                 st.info("请先完成争议地图。")
@@ -1385,7 +1379,7 @@ if tabs[2].open:
                         width="stretch",
                     ):
                         queue_confirmation("resume", case_id, role)
-                        st.rerun()
+                        rerun()
                 else:
                     st.caption(f"只有请求暂停的 {paused_by} 可以恢复调解。")
             elif pending:
@@ -1400,18 +1394,9 @@ if tabs[2].open:
                     icon=":material/pause:",
                 ):
                     queue_confirmation("pause", case_id, role)
-                    st.rerun()
+                    rerun()
 
-            for message in messages:
-                if message["sender"] in {"JUDGE", "SYSTEM"}:
-                    st.chat_message("assistant").markdown(
-                        f"**{message['sender']}**\n\n{message['content']}"
-                    )
-                else:
-                    st.chat_message("user").markdown(
-                        f"**{message['sender']}**\n\n{message['content']}"
-                    )
-
+            message_history = st.container()
             if can_write:
                 text = st.chat_input(
                     f"以 {role} 身份发言",
@@ -1421,14 +1406,53 @@ if tabs[2].open:
                 )
                 if text:
                     try:
-                        database.add_message(case_id, role, text)
+                        message = database.add_message(case_id, role, text)
                     except CaseStateError as error:
                         st.warning(str(error))
                     except DatabaseError as error:
                         show_database_error(error)
                     else:
-                        st.rerun(scope="fragment")
+                        expected_id = (
+                            messages[-1]["id"] + 1 if messages else 1
+                        )
+                        if (
+                            message
+                            and message["id"] == expected_id
+                            and current_status != "MAP_READY"
+                        ):
+                            st.session_state[message_cache_key] = [
+                                *messages,
+                                message,
+                            ]
+                            revision = dict(
+                                st.session_state.get(revision_key, {})
+                            )
+                            revision.update(
+                                {
+                                    "status": message["case_status"],
+                                    "updated_at": message[
+                                        "case_updated_at"
+                                    ],
+                                    "latest_message_id": message["id"],
+                                }
+                            )
+                            st.session_state[revision_key] = revision
+                            messages = [*messages, message]
+                        else:
+                            rerun()
 
+            with message_history:
+                for message in messages:
+                    if message["sender"] in {"JUDGE", "SYSTEM"}:
+                        st.chat_message("assistant").markdown(
+                            f"**{message['sender']}**\n\n{message['content']}"
+                        )
+                    else:
+                        st.chat_message("user").markdown(
+                            f"**{message['sender']}**\n\n{message['content']}"
+                        )
+
+            if can_write:
                 if not llm_available():
                     st.caption("AI 法官尚未由网站管理员配置，双方仍可继续共享对话。")
                 if st.button(
@@ -1437,60 +1461,21 @@ if tabs[2].open:
                     disabled=not llm_available(),
                 ):
                     queue_confirmation("judge_intervention", case_id, role)
-                    st.rerun()
+                    rerun()
 
         shared_mediation_room()
 
 if tabs[3].open:
     with tabs[3]:
         st.markdown("### 最终仲裁")
-        try:
-            current_case = database.get_case(case_id)
-            dispute = database.get_artifact(case_id, "DISPUTE_MAP")
-            final_artifact = database.get_artifact(case_id, "FINAL_JUDGMENT")
-            normal_checkpoint = database.get_artifact(
-                case_id,
-                "JUDGMENT_NORMAL",
-            )
-            swapped_checkpoint = database.get_artifact(
-                case_id,
-                "JUDGMENT_SWAPPED",
-            )
-            meta_checkpoint = database.get_artifact(case_id, "META_JUDGMENT")
-            evidence = database.get_arbitration_evidence(case_id)
-        except DatabaseError as error:
-            show_database_error(error)
-            current_case = None
-            dispute = None
-            final_artifact = None
-            normal_checkpoint = None
-            swapped_checkpoint = None
-            meta_checkpoint = None
-            evidence = None
-
-        @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
-        @observe_fragment("final_arbitration")
-        def sync_final_arbitration(rendered_status, rendered_final_ready):
-            try:
-                fresh_case = database.get_case(case_id)
-                fresh_final = database.get_artifact(case_id, "FINAL_JUDGMENT")
-            except DatabaseError as error:
-                show_database_error(error)
-                return
-
-            fresh_status = fresh_case["status"] if fresh_case else None
-            fresh_final_ready = bool(fresh_final and fresh_final["content"])
-            if (fresh_status, fresh_final_ready) != (
-                rendered_status,
-                rendered_final_ready,
-            ):
-                st.rerun()
-
-        if current_case and current_case["status"] != "CLOSED":
-            sync_final_arbitration(
-                current_case["status"],
-                bool(final_artifact and final_artifact["content"]),
-            )
+        current_case = page_snapshot["case"]
+        artifacts = page_snapshot["artifacts"]
+        dispute = artifacts.get("DISPUTE_MAP")
+        final_artifact = artifacts.get("FINAL_JUDGMENT")
+        normal_checkpoint = artifacts.get("JUDGMENT_NORMAL")
+        swapped_checkpoint = artifacts.get("JUDGMENT_SWAPPED")
+        meta_checkpoint = artifacts.get("META_JUDGMENT")
+        evidence = page_snapshot["evidence"]
 
         if not current_case:
             st.error("案件已不可用。")
@@ -1523,7 +1508,7 @@ if tabs[3].open:
                         except DatabaseError as error:
                             show_database_error(error)
                         else:
-                            st.rerun()
+                            rerun()
                 else:
                     st.warning(
                         f"{requester} 希望结束当前调解并进入最终仲裁。\n\n"
@@ -1549,14 +1534,14 @@ if tabs[3].open:
                             case_id,
                             role,
                         )
-                        st.rerun()
+                        rerun()
                     if confirm_arbitration:
                         queue_confirmation(
                             "arbitration_accept",
                             case_id,
                             role,
                         )
-                        st.rerun()
+                        rerun()
             elif status == "ARBITRATING":
                 st.warning(
                     "🔒 本轮证据已冻结\n\n"
@@ -1606,7 +1591,7 @@ if tabs[3].open:
                         except DatabaseError as error:
                             show_database_error(error)
                         else:
-                            st.rerun()
+                            rerun()
                 elif not final_artifact:
                     if st.button(
                         "继续最终仲裁",
@@ -1615,7 +1600,7 @@ if tabs[3].open:
                         width="stretch",
                     ):
                         if start_or_resume_final_arbitration(case_id):
-                            st.rerun()
+                            rerun()
                 elif not final_artifact["content"]:
                     st.caption("已有执行正在进行；超过安全恢复时间后可重新检查。")
                     if st.button(
@@ -1624,7 +1609,7 @@ if tabs[3].open:
                         width="stretch",
                     ):
                         if start_or_resume_final_arbitration(case_id):
-                            st.rerun()
+                            rerun()
             elif status == "PAUSED":
                 st.info("请先由暂停申请方恢复调解，再申请进入最终仲裁。")
             elif status in {"MAP_READY", "MEDIATING"}:
@@ -1644,7 +1629,7 @@ if tabs[3].open:
                         case_id,
                         role,
                     )
-                    st.rerun()
+                    rerun()
             else:
                 st.info("当前案件尚未进入可以申请最终仲裁的阶段。")
 
@@ -1652,3 +1637,4 @@ st.caption(
     "这是关系调解原型，不是法律裁判，也不能替代现实中的安全判断。"
     "如果涉及现实的人身威胁、暴力或胁迫，应优先处理现实安全。"
 )
+finish_trace(performance_trace)
