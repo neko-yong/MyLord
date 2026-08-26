@@ -60,6 +60,8 @@ def settings_for(mode, database_url=""):
         llm_model="",
         llm_api_key="",
         admin_create_secret="",
+        admin_console_route_key="",
+        admin_maintenance_secret="",
         dev_mode=True,
         llm_mode="mock",
         dev_database_mode="local" if mode == "fast" else "postgres",
