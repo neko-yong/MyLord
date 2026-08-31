@@ -229,10 +229,10 @@ class PerfAdminIntegrationTests(unittest.TestCase):
         find(admin_app.button, "Permanently delete").click()
         self._run(admin_app, database)
         confirmation = find(
-            admin_app.text_input,
-            "Type the full Case ID to confirm",
+            admin_app.checkbox,
+            "我确认删除这个案件，且无法恢复",
         )
-        confirmation.set_value(CASE_ID)
+        confirmation.check()
         self._run(admin_app, database)
         find(admin_app.button, "Delete permanently").click()
         self._run(admin_app, database)

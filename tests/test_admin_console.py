@@ -40,6 +40,7 @@ def visible_text(app):
         app.table,
         app.button,
         app.text_input,
+        app.checkbox,
     )
     return "\n".join(
         f"{getattr(element, 'value', '')} {getattr(element, 'label', '')}"
@@ -250,14 +251,10 @@ class AdminConsoleAppTests(unittest.TestCase):
 
         find(app.button, "Permanently delete").click()
         self._run(app, database)
-        confirmation = find(app.text_input, "Type the full Case ID to confirm")
-        confirmation.set_value("CASE-ABC12")
-        self._run(app, database)
         self.assertTrue(find(app.button, "Delete permanently").disabled)
         self.assertEqual(database.delete_calls, [])
 
-        confirmation = find(app.text_input, "Type the full Case ID to confirm")
-        confirmation.set_value(CASE_ID)
+        find(app.checkbox, "我确认删除这个案件，且无法恢复").check()
         self._run(app, database)
         self.assertFalse(find(app.button, "Delete permanently").disabled)
 

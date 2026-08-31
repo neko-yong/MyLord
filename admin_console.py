@@ -23,15 +23,19 @@ def is_admin_route(query_params, configured_route_key):
     return secure_secret_matches(candidate, configured_route_key)
 
 
+def _clear_admin_delete_state():
+    case_id = st.session_state.pop(_ADMIN_DELETE_CASE_KEY, None)
+    if case_id:
+        st.session_state.pop(f"admin_delete_acknowledged_{case_id}", None)
+
+
 def _clear_admin_case_state():
-    for key in (
-        _ADMIN_SELECTED_CASE_KEY,
-        _ADMIN_DELETE_CASE_KEY,
-    ):
-        st.session_state.pop(key, None)
+    _clear_admin_delete_state()
+    st.session_state.pop(_ADMIN_SELECTED_CASE_KEY, None)
 
 
 def _submit_admin_login(expected_secret):
+    _clear_admin_case_state()
     candidate = st.session_state.get("_admin_login_secret", "")
     authenticated = secure_secret_matches(candidate, expected_secret)
     st.session_state["_admin_login_secret"] = ""
@@ -87,6 +91,12 @@ def _render_delete_result():
     result = st.session_state.pop(_ADMIN_DELETE_NOTICE_KEY, None)
     if not result:
         return
+    if "error" in result:
+        st.error(result["error"])
+        return
+    if "warning" in result:
+        st.warning(result["warning"])
+        return
     st.success(f"{result['case_id']} deleted.")
     counts = result["deleted_counts"]
     st.table(
@@ -104,50 +114,65 @@ def _render_delete_result():
 
 
 def _render_delete_confirmation(database, case_id):
+    if st.session_state.get(_ADMIN_SELECTED_CASE_KEY) != case_id:
+        _clear_admin_case_state()
+        st.warning("Delete target changed. Search for the exact Case ID again.")
+        return
+
     pending_case_id = st.session_state.get(_ADMIN_DELETE_CASE_KEY)
     if pending_case_id != case_id:
+        _clear_admin_delete_state()
         if st.button(
             "Permanently delete",
             icon=":material/delete_forever:",
             key=f"admin_start_delete_{case_id}",
         ):
+            st.session_state.pop(f"admin_delete_acknowledged_{case_id}", None)
             st.session_state[_ADMIN_DELETE_CASE_KEY] = case_id
             st.rerun()
         return
 
     with st.container(border=True):
         st.error(f"Permanently delete {case_id} and all linked records?")
-        typed_case_id = st.text_input(
-            "Type the full Case ID to confirm",
-            key=f"admin_delete_confirmation_{case_id}",
-            max_chars=128,
+        acknowledged = st.checkbox(
+            "我确认删除这个案件，且无法恢复",
+            key=f"admin_delete_acknowledged_{case_id}",
         )
         with st.container(horizontal=True):
-            cancel = st.button(
+            st.button(
                 "Cancel",
                 key=f"admin_cancel_delete_{case_id}",
+                on_click=_clear_admin_delete_state,
             )
             confirm = st.button(
                 "Delete permanently",
                 type="primary",
                 icon=":material/delete_forever:",
-                disabled=typed_case_id != case_id,
+                disabled=not acknowledged,
                 key=f"admin_confirm_delete_{case_id}",
             )
 
-        if cancel:
-            st.session_state.pop(_ADMIN_DELETE_CASE_KEY, None)
-            st.rerun()
         if confirm:
-            if typed_case_id != case_id:
-                st.error("The confirmation Case ID does not match.")
-                return
-            result = database.delete_case_exact(case_id)
+            if (
+                not acknowledged
+                or not st.session_state.get(_ADMIN_AUTH_KEY)
+                or st.session_state.get(_ADMIN_SELECTED_CASE_KEY) != case_id
+                or st.session_state.get(_ADMIN_DELETE_CASE_KEY) != case_id
+            ):
+                _clear_admin_case_state()
+                st.session_state[_ADMIN_DELETE_NOTICE_KEY] = {
+                    "error": "Delete not confirmed. Search for the exact Case ID again."
+                }
+                st.rerun()
+            # Consume this confirmation even if the database call fails.
             _clear_admin_case_state()
-            if result is None:
-                st.warning("Case not found or already deleted.")
-                return
-            st.session_state[_ADMIN_DELETE_NOTICE_KEY] = result
+            try:
+                result = database.delete_case_exact(case_id)
+            except DatabaseError as error:
+                result = {"error": str(error)}
+            st.session_state[_ADMIN_DELETE_NOTICE_KEY] = result or {
+                "warning": "Case not found or already deleted."
+            }
             st.rerun()
 
 
@@ -162,11 +187,11 @@ def _render_exact_search(database):
         submitted = st.form_submit_button(
             "Find case",
             icon=":material/search:",
+            on_click=_clear_admin_case_state,
         )
 
     if submitted:
         metadata = database.get_case_admin_metadata(requested_case_id)
-        st.session_state.pop(_ADMIN_DELETE_CASE_KEY, None)
         if metadata is None:
             st.session_state.pop(_ADMIN_SELECTED_CASE_KEY, None)
             st.warning("Exact Case ID not found.")
@@ -182,6 +207,10 @@ def _render_exact_search(database):
         st.warning("Case not found or already deleted.")
         return
     _render_case_table([metadata], "admin_exact_case_table")
+    st.caption(
+        "请核对上方案件 ID、状态及时间。当前安全元数据未提供标题和关联记录数量；"
+        "永久删除会同时清理该案件的全部关联记录，且无法恢复。"
+    )
     _render_delete_confirmation(database, metadata["case_id"])
 
 
@@ -232,6 +261,7 @@ def render_admin_console(settings, database_factory=get_database):
 
     st.session_state.setdefault(_ADMIN_AUTH_KEY, False)
     if not st.session_state[_ADMIN_AUTH_KEY]:
+        _clear_admin_case_state()
         _render_login(settings)
         return
 
@@ -253,4 +283,5 @@ def render_admin_console(settings, database_factory=get_database):
         st.divider()
         _render_exact_search(database)
     except DatabaseError as error:
+        _clear_admin_case_state()
         st.error(str(error), icon=":material/database:")
