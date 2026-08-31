@@ -1,5 +1,6 @@
 """Loopback-only browser fixture: production UI, memory DB, synthetic data."""
 import logging
+import json
 import os
 import subprocess
 import threading
@@ -13,7 +14,7 @@ import streamlit as st
 import config
 import database_resources
 import llm
-from db import hash_token
+from db import DatabaseUnavailable, hash_token
 from dev_memory_db import DevMemoryDatabase, new_dev_local_store
 
 
@@ -28,14 +29,39 @@ MEMORY = DevMemoryDatabase(LOCAL, STORE)
 CASE_ID, _, _ = MEMORY.create_case("[DEV_TEST] Freeze browser gate")
 STORE["cases"][CASE_ID]["a_token_hash"] = hash_token("A-browser-fixture")
 STORE["cases"][CASE_ID]["b_token_hash"] = hash_token("B-browser-fixture")
-MEMORY.save_statement(CASE_ID, "A", "Synthetic A statement for browser gate")
-MEMORY.save_statement(CASE_ID, "B", "Synthetic B statement for browser gate")
-reservation = MEMORY.claim_artifact(CASE_ID, "DISPUTE_MAP")
-MEMORY.complete_artifact(CASE_ID, reservation, "DISPUTE_MAP", "Synthetic dispute map")
+if os.environ.get("FREEZE_GATE_START") != "collecting":
+    MEMORY.save_statement(CASE_ID, "A", "Synthetic A statement for browser gate")
+    MEMORY.save_statement(CASE_ID, "B", "Synthetic B statement for browser gate")
+    reservation = MEMORY.claim_artifact(CASE_ID, "DISPUTE_MAP")
+    MEMORY.complete_artifact(CASE_ID, reservation, "DISPUTE_MAP", "Synthetic dispute map")
 CALLS = Counter()
 LOCK = threading.RLock()
 LOG = logging.getLogger("freeze_browser_gate")
 LOG.setLevel(logging.WARNING)
+DELAYS = json.loads(os.environ.get("FREEZE_GATE_DELAYS", "{}"))
+AFTER_DELAYS = json.loads(os.environ.get("FREEZE_GATE_AFTER_DELAYS", "{}"))
+FAIL_BEFORE = json.loads(os.environ.get("FREEZE_GATE_FAIL_BEFORE", "{}"))
+FAIL_AFTER = json.loads(os.environ.get("FREEZE_GATE_FAIL_AFTER", "{}"))
+ARTIFACT_DIR = ROOT / "tests" / "artifacts"
+ARTIFACT_DIR.mkdir(exist_ok=True)
+handler = logging.FileHandler(ARTIFACT_DIR / f"freeze-{os.getpid()}.log", encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(created).6f thread=%(thread)d %(message)s"))
+for name in ("freeze_browser_gate", "state_trace", "performance"):
+    logging.getLogger(name).addHandler(handler)
+
+
+def begin_operation(name, default_delay=0):
+    with LOCK:
+        CALLS[name] += 1
+        ordinal = CALLS[name]
+    delays = DELAYS.get(name, [default_delay])
+    delay = delays[(ordinal - 1) % len(delays)]
+    LOG.warning("GATE start=%s ordinal=%d delay=%.3f", name, ordinal, delay)
+    time.sleep(delay)
+    if ordinal in FAIL_BEFORE.get(name, []):
+        LOG.warning("GATE injected_failure=%s ordinal=%d phase=before", name, ordinal)
+        raise DatabaseUnavailable("Synthetic temporary dependency failure")
+    return ordinal
 
 
 class FixtureDatabase:
@@ -43,13 +69,25 @@ class FixtureDatabase:
         method = getattr(MEMORY, name)
 
         def call(*args, **kwargs):
-            LOG.warning("GATE db_start=%s", name)
-            if name in {"request_arbitration", "confirm_arbitration"}:
-                time.sleep(float(os.environ.get("FREEZE_GATE_DB_DELAY", "0")))
-            with LOCK:
-                CALLS[name] += 1
-                result = method(*args, **kwargs)
-            LOG.warning("GATE db_finish=%s status=%s", name, MEMORY.get_case(CASE_ID)["status"])
+            default_delay = float(os.environ.get("FREEZE_GATE_DB_DELAY", "0")) if name in {
+                "request_arbitration", "confirm_arbitration"
+            } else 0
+            ordinal = begin_operation(name, default_delay)
+            try:
+                with LOCK:
+                    result = method(*args, **kwargs)
+                delays = AFTER_DELAYS.get(name, [0])
+                after_delay = delays[(ordinal - 1) % len(delays)]
+                if after_delay:
+                    LOG.warning("GATE response_delay=%s ordinal=%d delay=%.3f", name, ordinal, after_delay)
+                    time.sleep(after_delay)
+                if ordinal in FAIL_AFTER.get(name, []):
+                    LOG.warning("GATE injected_failure=%s ordinal=%d phase=after", name, ordinal)
+                    raise DatabaseUnavailable("Synthetic response failure after commit")
+            except Exception:
+                LOG.warning("GATE failed=%s ordinal=%d", name, ordinal)
+                raise
+            LOG.warning("GATE finish=%s ordinal=%d status=%s", name, ordinal, MEMORY.get_case(CASE_ID)["status"])
             return result
 
         return call
@@ -72,12 +110,12 @@ st.secrets.load_if_toml_exists = lambda: False
 
 
 def mock_call(**_kwargs):
-    with LOCK:
-        CALLS["mock_llm"] += 1
-    LOG.warning("GATE llm_start")
     delay = float(os.environ.get("FREEZE_GATE_LLM_DELAY", "3"))
-    time.sleep(delay)
-    LOG.warning("GATE llm_finish")
+    try:
+        ordinal = begin_operation("mock_llm", delay)
+    except DatabaseUnavailable:
+        raise llm.LLMError("timeout", "Synthetic model timeout") from None
+    LOG.warning("GATE finish=mock_llm ordinal=%d", ordinal)
     return llm.LLMResult(
         content="Synthetic final judgment", model="fixture-mock",
         finish_reason="stop", prompt_tokens=0, completion_tokens=0,

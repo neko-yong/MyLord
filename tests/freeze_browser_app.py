@@ -11,4 +11,14 @@ import freeze_browser_support as fixture
 
 st.caption(f"LOCAL FIXTURE ONLY — Case ID: {fixture.CASE_ID}")
 source = fixture.BASELINE if st.query_params.get("baseline") == "1" else (ROOT / "app.py").read_text(encoding="utf-8")
-exec(compile(source, str(ROOT / "app.py"), "exec"), globals())
+fixture.LOG.warning("GATE ui_run=start")
+try:
+    exec(compile(source, str(ROOT / "app.py"), "exec"), globals())
+except Exception:
+    fixture.LOG.warning("GATE ui_run=failed")
+    raise
+except BaseException:
+    fixture.LOG.warning("GATE ui_run=interrupted")
+    raise
+else:
+    fixture.LOG.warning("GATE ui_run=complete")

@@ -253,19 +253,26 @@ def build_dispute_map_prompt(statements):
 
 
 def run_reserved_dispute_map(case_id, reservation_id):
-    statements = database.get_statements_for_llm(case_id)
     with st.spinner("AI 法官正在整理双方事实、分歧和待确认事项…"):
-        result = ask(
-            DISPUTE_MAP_PROMPT,
-            build_dispute_map_prompt(statements),
-            max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
-        )
-    database.complete_artifact(
-        case_id,
-        reservation_id,
-        "DISPUTE_MAP",
-        result.content,
-    )
+        # Spinner cleanup can interrupt this run. Settle the reservation first.
+        try:
+            statements = database.get_statements_for_llm(case_id)
+            result = ask(
+                DISPUTE_MAP_PROMPT,
+                build_dispute_map_prompt(statements),
+                max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
+            )
+            trace_event("artifact_persist_started")
+            database.complete_artifact(
+                case_id,
+                reservation_id,
+                "DISPUTE_MAP",
+                result.content,
+            )
+            trace_event("artifact_persisted")
+        except (LLMError, DatabaseError):
+            mark_dispute_map_failed(case_id, reservation_id)
+            raise
 
 
 def mark_dispute_map_failed(case_id, reservation_id):
@@ -280,14 +287,12 @@ def finish_dispute_map_generation(case_id, reservation_id):
     try:
         run_reserved_dispute_map(case_id, reservation_id)
     except LLMError as error:
-        mark_dispute_map_failed(case_id, reservation_id)
         show_llm_error(error)
         st.warning(
             "独立陈述已经成功冻结，争议地图尚未生成。请稍后重新尝试。"
         )
         return False
     except DatabaseError as error:
-        mark_dispute_map_failed(case_id, reservation_id)
         show_database_error(error)
         return False
     return True
@@ -1233,6 +1238,9 @@ try:
 except DatabaseError as error:
     trace_event("snapshot_failed")
     show_database_error(error)
+    # Keep the selected widget value when this run cannot render the tabs.
+    st.session_state["case_tab"] = selected_tab
+    st.button("重试加载案件", key="retry_case_snapshot")
     stop()
 
 if not page_snapshot:
