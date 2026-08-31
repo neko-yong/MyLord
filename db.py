@@ -1701,6 +1701,12 @@ class Database:
                     WHERE case_id = %s AND status = ANY(%s)
                     RETURNING case_id, status, updated_at
                 ),
+                previous_message AS (
+                    SELECT COALESCE(MAX(message.id), 0) AS id
+                    FROM messages AS message
+                    JOIN eligible_case
+                        ON eligible_case.case_id = message.case_id
+                ),
                 inserted_message AS (
                     INSERT INTO messages(
                         case_id,
@@ -1715,9 +1721,11 @@ class Database:
                 SELECT
                     inserted_message.*,
                     eligible_case.status AS case_status,
-                    eligible_case.updated_at AS case_updated_at
+                    eligible_case.updated_at AS case_updated_at,
+                    previous_message.id AS previous_message_id
                 FROM inserted_message
                 JOIN eligible_case USING (case_id)
+                CROSS JOIN previous_message
                 """,
                 (
                     case_id,

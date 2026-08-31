@@ -756,6 +756,10 @@ class DevMemoryDatabase:
         case = self._case(case_id)
         if case["status"] not in MESSAGE_ALLOWED_STATUSES:
             raise CaseStateError("当前案件状态不允许发送新消息。")
+        existing_messages = self.store["messages"].setdefault(case_id, [])
+        previous_message_id = (
+            existing_messages[-1]["id"] if existing_messages else 0
+        )
         message = {
             "id": self._next("message_sequence"),
             "case_id": case_id,
@@ -763,13 +767,14 @@ class DevMemoryDatabase:
             "content": content.strip(),
             "created_at": _now(),
         }
-        self.store["messages"].setdefault(case_id, []).append(message)
+        existing_messages.append(message)
         if case["status"] == "MAP_READY":
             case["status"] = "MEDIATING"
         self._touch(case)
         result = copy.deepcopy(message)
         result["case_status"] = case["status"]
         result["case_updated_at"] = case["updated_at"]
+        result["previous_message_id"] = previous_message_id
         return result
 
     def ensure_judge_intervention_allowed(self, case_id):
