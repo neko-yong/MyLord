@@ -6,6 +6,7 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 import database_resources
+from tests.test_app_chat_fragment import ChatDatabase
 
 
 CASE_ID = "CASE-INTEGRATION"
@@ -109,6 +110,41 @@ class IntegratedDatabase:
         }
 
 
+class ChatAdminDatabase(ChatDatabase):
+    def __init__(self):
+        super().__init__(
+            status="MAP_READY",
+            initial_message_ids=(),
+            inserted_message_ids=(41, 57, 88),
+        )
+        self.admin_calls = []
+        self.metadata_created_at = datetime.now(timezone.utc)
+
+    def _metadata(self):
+        return {
+            "case_id": "CASE-CHAT",
+            "status": self.status,
+            "created_at": self.metadata_created_at,
+            "updated_at": self.updated_at,
+        }
+
+    def list_case_metadata(self, limit, offset):
+        self.admin_calls.append(("list", limit, offset))
+        rows = [self._metadata()]
+        return {
+            "total": len(rows),
+            "cases": rows[offset : offset + limit],
+        }
+
+    def get_case_admin_metadata(self, case_id):
+        self.admin_calls.append(("get", case_id))
+        return self._metadata() if case_id == "CASE-CHAT" else None
+
+    def delete_case_exact(self, case_id):
+        self.admin_calls.append(("delete", case_id))
+        raise AssertionError("Cross-feature smoke must not delete a case")
+
+
 class PerfAdminIntegrationTests(unittest.TestCase):
     def setUp(self):
         database_resources.get_postgres_pool.clear()
@@ -210,6 +246,68 @@ class PerfAdminIntegrationTests(unittest.TestCase):
         self.assertIn("案件不存在或已不可用", errors)
         self.assertEqual(len(database.snapshot_calls), 2)
         self.assertEqual(database.delete_calls, [CASE_ID])
+
+    def test_a_b_chat_and_admin_refresh_search_are_isolated(self):
+        database = ChatAdminDatabase()
+
+        app_a = AppTest.from_file(self.app_path)
+        app_a.session_state["auth"] = {"case_id": "CASE-CHAT", "role": "A"}
+        app_a.session_state["case_tab"] = "③ 调解室"
+        self._run(app_a, database)
+
+        app_b = AppTest.from_file(self.app_path)
+        app_b.session_state["auth"] = {"case_id": "CASE-CHAT", "role": "B"}
+        app_b.session_state["case_tab"] = "③ 调解室"
+        self._run(app_b, database)
+
+        admin_app = AppTest.from_file(self.app_path)
+        admin_app.query_params["console"] = ROUTE_KEY
+        normal_snapshot_count = len(database.snapshot_views)
+        self._run(admin_app, database)
+        self.assertEqual(len(database.snapshot_views), normal_snapshot_count)
+
+        find(admin_app.text_input, "Maintenance secret").set_value(
+            MAINTENANCE_SECRET
+        )
+        find(admin_app.button, "Sign in").click()
+        self._run(admin_app, database)
+        self.assertEqual(database.admin_calls, [("list", 25, 0)])
+        self.assertEqual(len(database.snapshot_views), normal_snapshot_count)
+
+        admin_call_count = len(database.admin_calls)
+        app_a.chat_input[0].set_value("message 1 from A")
+        self._run(app_a, database)
+        self.assertEqual(len(database.admin_calls), admin_call_count)
+        self._run(app_b, database)
+        visible_b = "\n".join(str(item.value) for item in app_b.markdown)
+        self.assertIn("message 1 from A", visible_b)
+
+        self._run(admin_app, database)
+        find(admin_app.text_input, "Full Case ID").set_value("CASE-CHAT")
+        find(admin_app.button, "Find case").click()
+        self._run(admin_app, database)
+        self.assertEqual(database.admin_calls[-1], ("get", "CASE-CHAT"))
+        self.assertEqual(len(database.messages), 1)
+
+        admin_call_count = len(database.admin_calls)
+        app_b.chat_input[0].set_value("message 2 from B")
+        self._run(app_b, database)
+        self._run(app_a, database)
+        visible_a = "\n".join(str(item.value) for item in app_a.markdown)
+        self.assertIn("message 2 from B", visible_a)
+        self.assertEqual(len(database.admin_calls), admin_call_count)
+
+        app_a.chat_input[0].set_value("message 3 from A")
+        self._run(app_a, database)
+        self._run(app_b, database)
+        visible_b = "\n".join(str(item.value) for item in app_b.markdown)
+        self.assertIn("message 3 from A", visible_b)
+        self.assertEqual(
+            [message["id"] for message in database.messages],
+            [41, 57, 88],
+        )
+        self.assertFalse(app_a.chat_input[0].disabled)
+        self.assertFalse(app_b.chat_input[0].disabled)
 
 
 if __name__ == "__main__":

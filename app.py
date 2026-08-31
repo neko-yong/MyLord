@@ -44,10 +44,23 @@ from prompts import (
 from validation import build_statement_content, validate_statement_fields
 
 
+def _load_server_settings():
+    secret_values = st.secrets if st.secrets.load_if_toml_exists() else {}
+    return load_settings(secret_values)
+
+
+settings = _load_server_settings()
+admin_route = is_admin_route(
+    st.query_params,
+    settings.admin_console_route_key,
+)
 st.set_page_config(
-    page_title="双向关系仲裁员",
+    page_title=(
+        "Case maintenance" if admin_route else "双向关系仲裁员"
+    ),
     page_icon="⚖️",
-    layout="centered",
+    layout="wide" if admin_route else "centered",
+    initial_sidebar_state="collapsed" if admin_route else "auto",
 )
 
 
@@ -71,11 +84,6 @@ TAB_VIEWS = dict(zip(TAB_LABELS, ("statement", "dispute", "mediation", "final"))
 
 
 logger = logging.getLogger(__name__)
-
-
-def _load_server_settings():
-    secret_values = st.secrets if st.secrets.load_if_toml_exists() else {}
-    return load_settings(secret_values)
 
 
 def show_database_error(error):
@@ -588,10 +596,9 @@ def rerun(scope="app"):
     st.rerun(scope=scope)
 
 
-settings = _load_server_settings()
 performance_trace = start_trace(settings.perf_debug, "full_rerun", "app")
 st.session_state.setdefault("auth", None)
-if is_admin_route(st.query_params, settings.admin_console_route_key):
+if admin_route:
     render_admin_console(settings)
     st.stop()
 if settings.dev_mode:
@@ -1416,13 +1423,12 @@ if tabs[2].open:
                     except DatabaseError as error:
                         show_database_error(error)
                     else:
-                        expected_id = (
-                            messages[-1]["id"] + 1 if messages else 1
+                        latest_cached_id = (
+                            messages[-1]["id"] if messages else 0
                         )
                         if (
-                            message
-                            and message["id"] == expected_id
-                            and current_status != "MAP_READY"
+                            message.get("previous_message_id")
+                            == latest_cached_id
                         ):
                             st.session_state[message_cache_key] = [
                                 *messages,
@@ -1441,9 +1447,36 @@ if tabs[2].open:
                                 }
                             )
                             st.session_state[revision_key] = revision
+                            page_snapshot["revision"] = revision
+                            current_case["status"] = message["case_status"]
+                            current_case["updated_at"] = message[
+                                "case_updated_at"
+                            ]
                             messages = [*messages, message]
                         else:
-                            rerun()
+                            try:
+                                refreshed = database.get_case_view_snapshot(
+                                    case_id,
+                                    role,
+                                    "mediation",
+                                    latest_cached_id,
+                                )
+                            except DatabaseError as error:
+                                show_database_error(error)
+                            else:
+                                if refreshed:
+                                    messages = [
+                                        *messages,
+                                        *refreshed["messages"],
+                                    ]
+                                    st.session_state[message_cache_key] = messages
+                                    st.session_state[revision_key] = refreshed[
+                                        "revision"
+                                    ]
+                                    page_snapshot["revision"] = refreshed[
+                                        "revision"
+                                    ]
+                                    current_case.update(refreshed["case"])
 
             with message_history:
                 for message in messages:

@@ -223,7 +223,6 @@ def _render_case_list(database):
 
 
 def render_admin_console(settings, database_factory=get_database):
-    st.set_page_config(page_title="Case maintenance", layout="wide")
     st.title("Case maintenance console")
     st.caption("Operational metadata only. Private case content is not available here.")
 

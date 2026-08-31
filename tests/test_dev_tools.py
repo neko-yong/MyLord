@@ -337,12 +337,16 @@ class DevScenarioTests(unittest.TestCase):
 
         self.assertEqual(
             [line.strip() for line in source.splitlines() if "query_params" in line],
-            [
-                "if is_admin_route("
-                "st.query_params, settings.admin_console_route_key"
-                "):"
-            ],
+            ["st.query_params,"],
         )
+        self.assertIn(
+            "admin_route = is_admin_route(\n"
+            "    st.query_params,\n"
+            "    settings.admin_console_route_key,\n"
+            ")",
+            source,
+        )
+        self.assertIn("if admin_route:", source)
         self.assertNotIn("?dev=true", source.lower())
         self.assertNotIn("?debug=true", source.lower())
         self.assertNotIn("?database=local", source.lower())

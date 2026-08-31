@@ -311,6 +311,61 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                     )
                     self._cleanup_and_assert(dev_case.case_id)
 
+    def test_message_return_tracks_case_predecessor_across_global_id_gap(self):
+        run_id, case_id, _a_token, _b_token = self._create_map_ready_case(
+            "MESSAGE_PREDECESSOR"
+        )
+        _gap_run_id, gap_case_id, _gap_a_token, _gap_b_token = (
+            self._create_map_ready_case("MESSAGE_GLOBAL_GAP")
+        )
+        try:
+            first = self.first_session.add_message(
+                case_id,
+                "A",
+                f"FIRST_{run_id}",
+            )
+            gap = self.first_session.add_message(
+                gap_case_id,
+                "A",
+                f"GLOBAL_GAP_{run_id}",
+            )
+            second = self.second_session.add_message(
+                case_id,
+                "B",
+                f"SECOND_{run_id}",
+            )
+            third = self.first_session.add_message(
+                case_id,
+                "A",
+                f"THIRD_{run_id}",
+            )
+
+            expected_keys = {
+                "id",
+                "case_id",
+                "sender",
+                "content",
+                "created_at",
+                "case_status",
+                "case_updated_at",
+                "previous_message_id",
+            }
+            self.assertEqual(set(first), expected_keys)
+            self.assertEqual(first["previous_message_id"], 0)
+            self.assertEqual(first["case_status"], "MEDIATING")
+            self.assertLess(first["id"], gap["id"])
+            self.assertLess(gap["id"], second["id"])
+            self.assertNotEqual(second["id"], first["id"] + 1)
+            self.assertEqual(second["previous_message_id"], first["id"])
+            self.assertEqual(third["previous_message_id"], second["id"])
+            self.assertEqual(
+                [message["id"] for message in self.first_session.get_messages(case_id)],
+                [first["id"], second["id"], third["id"]],
+            )
+        finally:
+            self._cleanup_and_assert(case_id)
+            self._cleanup_and_assert(gap_case_id)
+
     def test_shared_case_and_evidence_freeze_flow(self):
         database_a = self.first_session
         database_b = self.second_session

@@ -176,6 +176,7 @@ class ArbitrationStateMachineTests(unittest.TestCase):
                     "created_at": "now",
                     "case_status": "ARBITRATION_PENDING",
                     "case_updated_at": "now",
+                    "previous_message_id": 17,
                 }
             ),
         )
@@ -183,8 +184,10 @@ class ArbitrationStateMachineTests(unittest.TestCase):
         message = database.add_message("CASE-TEST", "A", "pending message")
 
         self.assertEqual(message["id"], 1)
+        self.assertEqual(message["previous_message_id"], 17)
         self.assertEqual(len(connection.calls), 1)
         self.assertIn("WITH eligible_case", connection.calls[0][0])
+        self.assertIn("previous_message", connection.calls[0][0])
         self.assertIn("status = ANY", connection.calls[0][0])
 
     def test_arbitrating_and_closed_messages_are_rejected(self):
