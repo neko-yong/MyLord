@@ -33,7 +33,11 @@ def observable_workflow(database, settings):
 
         database.request_arbitration(case_id, "A")
         pending = database.get_case(case_id)
-        database.add_message(case_id, "B", "Contract pending message")
+        pending_message = database.add_message(
+            case_id,
+            "B",
+            "Contract pending message",
+        )
         pending_count = len(database.get_messages(case_id))
         database.cancel_arbitration_request(case_id, "B")
         declined = database.get_unread_notifications(case_id, "A")
@@ -89,6 +93,12 @@ def observable_workflow(database, settings):
             "pending_status": pending["status"],
             "pending_requester": pending["arbitration_requested_by"],
             "pending_message_delta": pending_count - len(initial_messages),
+            "pending_message_keys": tuple(sorted(pending_message)),
+            "pending_message_previous_matches": (
+                pending_message["previous_message_id"]
+                == initial_messages[-1]["id"]
+            ),
+            "pending_message_case_status": pending_message["case_status"],
             "cancel_status": after_cancel["status"],
             "declined_notification": declined[0]["event_type"],
             "declined_ack": declined_ack,
@@ -123,6 +133,12 @@ class BackendContractTests(unittest.TestCase):
         self.assertEqual(result["pending_status"], "ARBITRATION_PENDING")
         self.assertEqual(result["pending_requester"], "A")
         self.assertEqual(result["pending_message_delta"], 1)
+        self.assertTrue(result["pending_message_previous_matches"])
+        self.assertEqual(
+            result["pending_message_case_status"],
+            "ARBITRATION_PENDING",
+        )
+        self.assertIn("previous_message_id", result["pending_message_keys"])
         self.assertEqual(result["cancel_status"], "MEDIATING")
         self.assertEqual(result["declined_notification"], "ARBITRATION_DECLINED")
         self.assertTrue(result["declined_ack"])
