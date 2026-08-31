@@ -149,10 +149,13 @@ Use mapOwnerInterruptionGate(a,b) from tests/freeze_browser_gate.mjs through the
 
 ## Git
 
+Connection/foreground follow-up: no additional application change or reproduction claim. These cases remain untested because the supported browser/tool surface cannot reliably control and verify them. The documentation-only [field evidence plan](D:/桌面/法官/relationship_mediator_hotfix_navigation_arbitration/FREEZE_FIELD_EVIDENCE_PLAN.md) defines the missing non-sensitive facts, event boundaries, interpretation limits and separate authorization required before any live instrumentation.
+
 Branch: hotfix/navigation-arbitration-freeze
 Base: bef2e47d58a018c2ccf87458a5ff4a9fe38be2d1
 Previous diagnostic checkpoint: e852af3
-Commit: this follow-up checkpoint's HEAD; exact hash is given in the final handoff.
+Implementation checkpoint: a1cc946584d337b7604aa7eee887a314347120a6 (preserved, not amended).
+Commit: current HEAD may include the documentation-only field-plan addendum; the exact hash is given in the final handoff.
 Worktree clean: verified after commit in the final handoff; ignored synthetic runtime artifacts are retained.
 Merged main: NO
 Pushed main: NO
