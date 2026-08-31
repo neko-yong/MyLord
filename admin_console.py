@@ -24,9 +24,11 @@ def is_admin_route(query_params, configured_route_key):
 
 
 def _clear_admin_delete_state():
-    case_id = st.session_state.pop(_ADMIN_DELETE_CASE_KEY, None)
-    if case_id:
-        st.session_state.pop(f"admin_delete_acknowledged_{case_id}", None)
+    st.session_state.pop(_ADMIN_DELETE_CASE_KEY, None)
+    # Pending may have changed or disappeared; clear all acknowledgements we own.
+    for key in list(st.session_state):
+        if key.startswith("admin_delete_acknowledged_"):
+            st.session_state.pop(key, None)
 
 
 def _clear_admin_case_state():

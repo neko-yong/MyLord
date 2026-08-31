@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import streamlit as st
 
+import admin_console
 from db import DatabaseError
 from tests import test_admin_console as admin_tests
 
@@ -186,6 +187,40 @@ class AdminDeleteConfirmationTests(unittest.TestCase):
             self._click("Delete permanently")
         self.assertEqual(self.database.delete_calls, [])
 
+    def test_pending_target_changed_after_render_prevents_write(self):
+        self._open()
+        self._acknowledge()
+        real_button = st.button
+
+        def changed_pending(label, *args, **kwargs):
+            clicked = real_button(label, *args, **kwargs)
+            if label == "Delete permanently" and clicked:
+                st.session_state["_admin_delete_case_id"] = OTHER_CASE_ID
+            return clicked
+
+        with patch("streamlit.button", side_effect=changed_pending):
+            self._click("Delete permanently")
+        self.assertEqual(self.database.delete_calls, [])
+        self.assertNotIn("_admin_selected_case_id", self.app.session_state)
+        self._assert_confirmation_cleared()
+
+    def test_missing_pending_after_render_clears_old_acknowledgement(self):
+        self._open()
+        self._acknowledge()
+        real_button = st.button
+
+        def missing_pending(label, *args, **kwargs):
+            clicked = real_button(label, *args, **kwargs)
+            if label == "Delete permanently" and clicked:
+                st.session_state.pop("_admin_delete_case_id", None)
+            return clicked
+
+        with patch("streamlit.button", side_effect=missing_pending):
+            self._click("Delete permanently")
+        self.assertEqual(self.database.delete_calls, [])
+        self.assertNotIn("_admin_selected_case_id", self.app.session_state)
+        self._assert_confirmation_cleared()
+
     def test_lost_authentication_blocks_a_pending_delete(self):
         self._open()
         self._acknowledge()
@@ -265,6 +300,31 @@ class AdminDeleteConfirmationTests(unittest.TestCase):
         self._assert_confirmation_cleared()
         self._run()
         self.assertEqual(self.database.delete_calls, [])
+
+
+class AdminDeleteStateCleanupTests(unittest.TestCase):
+    def test_cleanup_removes_all_owned_acknowledgements_and_nothing_else(self):
+        preserved = {
+            "_admin_authenticated": True,
+            "_admin_page": 2,
+            "_admin_selected_case_id": admin_tests.CASE_ID,
+            "auth": {"case_id": "CASE-USER", "role": "A"},
+            "other_checkbox": True,
+            "other_admin_delete_acknowledged_choice": True,
+        }
+        for pending in (None, admin_tests.CASE_ID, OTHER_CASE_ID):
+            with self.subTest(pending=pending):
+                state = {
+                    **preserved,
+                    f"admin_delete_acknowledged_{admin_tests.CASE_ID}": True,
+                    f"admin_delete_acknowledged_{OTHER_CASE_ID}": False,
+                    "admin_delete_acknowledged_CASE-OLD": True,
+                }
+                if pending is not None:
+                    state["_admin_delete_case_id"] = pending
+                with patch("admin_console.st.session_state", state):
+                    admin_console._clear_admin_delete_state()
+                self.assertEqual(state, preserved)
 
 
 if __name__ == "__main__":
