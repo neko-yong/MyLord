@@ -26,6 +26,7 @@ from dev_tools import (
     seed_dev_case,
     switch_dev_role,
 )
+from dispute_map_view import render_dispute_map, render_mediation_context
 from llm import LLMError, TASK_MAX_TOKENS, call_llm
 from mock_llm import MockLLM
 from performance import (
@@ -1326,7 +1327,7 @@ if tabs[1].open:
         dispute = page_snapshot["artifacts"].get("DISPUTE_MAP")
 
         if dispute and dispute["content"]:
-            st.markdown(dispute["content"])
+            render_dispute_map(dispute["content"])
         elif dispute and dispute.get("generation_failed_at"):
             st.warning(
                 "争议地图整理失败，但双方独立陈述已经安全冻结。"
@@ -1345,6 +1346,7 @@ if tabs[1].open:
 if tabs[2].open:
     with tabs[2]:
         st.markdown("### 共享调解室")
+        render_mediation_context(page_snapshot["artifacts"].get("DISPUTE_MAP"))
 
         @st.fragment
         @observe_fragment("mediation_room")
