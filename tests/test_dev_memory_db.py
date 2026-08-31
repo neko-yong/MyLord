@@ -388,7 +388,12 @@ class DevMemoryDatabaseTests(unittest.TestCase):
         cursor = initial["messages"][-1]["id"]
         revision = initial["revision"]
 
-        self.database.add_message(case_id, "B", "cross-client message")
+        message = self.database.add_message(
+            case_id,
+            "B",
+            "cross-client message",
+        )
+        self.assertEqual(message["previous_message_id"], cursor)
         changed = self.database.get_case_revision(case_id, "A")
         self.assertNotEqual(changed, revision)
         incremental = self.database.get_case_view_snapshot(

@@ -1416,13 +1416,12 @@ if tabs[2].open:
                     except DatabaseError as error:
                         show_database_error(error)
                     else:
-                        expected_id = (
-                            messages[-1]["id"] + 1 if messages else 1
+                        latest_cached_id = (
+                            messages[-1]["id"] if messages else 0
                         )
                         if (
-                            message
-                            and message["id"] == expected_id
-                            and current_status != "MAP_READY"
+                            message.get("previous_message_id")
+                            == latest_cached_id
                         ):
                             st.session_state[message_cache_key] = [
                                 *messages,
@@ -1441,9 +1440,36 @@ if tabs[2].open:
                                 }
                             )
                             st.session_state[revision_key] = revision
+                            page_snapshot["revision"] = revision
+                            current_case["status"] = message["case_status"]
+                            current_case["updated_at"] = message[
+                                "case_updated_at"
+                            ]
                             messages = [*messages, message]
                         else:
-                            rerun()
+                            try:
+                                refreshed = database.get_case_view_snapshot(
+                                    case_id,
+                                    role,
+                                    "mediation",
+                                    latest_cached_id,
+                                )
+                            except DatabaseError as error:
+                                show_database_error(error)
+                            else:
+                                if refreshed:
+                                    messages = [
+                                        *messages,
+                                        *refreshed["messages"],
+                                    ]
+                                    st.session_state[message_cache_key] = messages
+                                    st.session_state[revision_key] = refreshed[
+                                        "revision"
+                                    ]
+                                    page_snapshot["revision"] = refreshed[
+                                        "revision"
+                                    ]
+                                    current_case.update(refreshed["case"])
 
             with message_history:
                 for message in messages:
