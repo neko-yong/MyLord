@@ -6,6 +6,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+from streamlit import rerun as streamlit_rerun
 from streamlit.testing.v1 import AppTest
 
 from dispute_map_view import render_dispute_map, render_mediation_context
@@ -179,22 +180,29 @@ class DisputeMapAppTests(unittest.TestCase):
                 database = ContextDatabase(status="MAP_READY", initial_message_ids=(), inserted_message_ids=(41, 57, 88))
                 with (environment(database), patch("db.Database", return_value=database),
                       patch("streamlit.dialog", new=inline_dialog), patch("llm.call_llm") as llm,
-                      patch("streamlit.rerun") as rerun):
+                      patch("streamlit.rerun", wraps=streamlit_rerun) as rerun):
                     app = client(view="② 争议地图", baseline=baseline).run(timeout=15)
                     for view in ("③ 调解室", "① 独立陈述", "② 争议地图", "③ 调解室"):
                         app.session_state["case_tab"] = view
                         app.run(timeout=15)
                         self.assertFalse(app.exception)
+                        self.assertEqual(app.session_state["case_tab"], view)
                     self.assertEqual(database.snapshot_views, ["dispute", "mediation", "statement", "dispute", "mediation"])
                     self.assertEqual(database.revision_calls, 5)
                     for message in ("虚构首条", "虚构普通消息"):
+                        # AppTest 1.62 has no Tab interaction/serialization API.
+                        # Supply the active tab alongside each simulated submission.
+                        app.session_state["case_tab"] = "③ 调解室"
                         app.chat_input[0].set_value(message).run(timeout=15)
                         self.assertFalse(app.exception)
+                        self.assertEqual(app.session_state["case_tab"], "③ 调解室")
                         self.assertIn(message, text(app))
                         self.assertFalse(app.chat_input[0].disabled)
                     database.backfill = True
+                    app.session_state["case_tab"] = "③ 调解室"
                     app.chat_input[0].set_value("虚构并发回填后的消息").run(timeout=15)
                     self.assertFalse(app.exception)
+                    self.assertEqual(app.session_state["case_tab"], "③ 调解室")
                     self.assertIn("虚构并发消息", text(app))
                     self.assertEqual([message["id"] for message in database.messages], [41, 57, 80, 88])
                     self.assertEqual(database.write_calls, 3)
