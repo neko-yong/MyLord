@@ -26,12 +26,15 @@ MODULES = (
     "test_plain_language_prompts", "test_arbitration", "test_evidence",
     "test_llm", "test_mock_llm", "test_dev_fixtures", "test_dev_tools",
     "test_statement_validation", "test_app_auto_dispute_map",
-    "test_app_arbitration_ui", "test_app_chat_fragment", "test_config",
+    "test_app_arbitration_ui", "test_app_chat_fragment",
+    "test_app_dev_playground", "test_app_missing_database",
+    "test_app_statement_validation", "test_app_state_trace",
+    "test_confirmation_rerun_order", "test_state_trace", "test_config",
     "test_secret_redaction", "test_db_security", "test_database_resources",
     "test_dev_memory_db", "test_admin_layout_stability",
     "test_perf_admin_integration", "test_admin_console", "test_performance",
     "test_admin_delete_confirmation", "test_admin_database",
-    "test_database_state_machine",
+    "test_database_state_machine", "test_integration_config",
 )
 
 
@@ -120,6 +123,7 @@ def main():
     assert "border" in inspect.signature(st.container).parameters
     assert inspect.signature(st.expander).parameters["on_change"].default == "ignore"
     sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(ROOT / "tests"))
     package = types.ModuleType("tests")
     package.__path__ = [str(ROOT / "tests")]
     package.__package__ = "tests"

@@ -18,10 +18,11 @@ APP = Path(__file__).resolve().parents[1] / "app.py"
 
 
 def approved_baseline():
-    """Reconstruct the three-line prior view, then verify its pinned source hash.
+    """Remove the three UI contacts, then verify the pinned P0 source hash.
 
-    SHA-256 is of app.py at 74d1ae1902cb69e933363ee10b3679686f422c2f,
-    UTF-8 with LF. This fails on any other app change, including business logic.
+    SHA-256 is of app.py at 8b87b342f57a1a50b9e3d2aa9ae9e5502f74cd3c,
+    UTF-8 with LF. This keeps the P0 navigation, trace and write-order changes
+    inside the baseline while rejecting any other application change.
     """
     source = APP.read_text(encoding="utf-8")
     changes = (
@@ -33,7 +34,7 @@ def approved_baseline():
         assert source.count(new) == 1
         source = source.replace(new, old, 1)
     assert hashlib.sha256(source.encode()).hexdigest() == (
-        "635f8161f239028dbb77f17b3814f1a8b374bd285e0deada14aa99ff8db33919"
+        "67d633759bf2cd3851496ac9af22b27a733d216c9d064b9f614111db22621b08"
     )
     return source
 

@@ -16,6 +16,7 @@ import database_resources
 import llm
 from db import DatabaseUnavailable, hash_token
 from dev_memory_db import DevMemoryDatabase, new_dev_local_store
+from tests.test_dispute_map_view import fictional_map
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +40,7 @@ if os.environ.get("FREEZE_GATE_START") != "collecting":
     MEMORY.save_statement(CASE_ID, "A", "Synthetic A statement for browser gate")
     MEMORY.save_statement(CASE_ID, "B", "Synthetic B statement for browser gate")
     reservation = MEMORY.claim_artifact(CASE_ID, "DISPUTE_MAP")
-    MEMORY.complete_artifact(CASE_ID, reservation, "DISPUTE_MAP", "Synthetic dispute map")
+    MEMORY.complete_artifact(CASE_ID, reservation, "DISPUTE_MAP", fictional_map())
 CALLS = Counter()
 LOCK = threading.RLock()
 RESET_STATE = {"nonce": None, "scenario": "map_ready", "seen": set()}
@@ -79,7 +80,7 @@ def reset_fixture(scenario, nonce):
                 CASE_ID,
                 reservation,
                 "DISPUTE_MAP",
-                "Synthetic dispute map for confirmation gate",
+                fictional_map(),
             )
         if scenario == "arbitration_accept":
             MEMORY.request_arbitration(CASE_ID, "A")

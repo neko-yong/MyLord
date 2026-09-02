@@ -11,7 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from arbitration import run_final_arbitration
-from llm import LLMResult, TASK_MAX_TOKENS
+from db import DatabaseError
+from llm import LLMError, LLMResult, TASK_MAX_TOKENS
 import prompts
 from tests.test_arbitration import EVIDENCE, EVIDENCE_HASH, FakeDatabase
 
@@ -35,7 +36,7 @@ def app_functions():
     source = Path(__file__).resolve().parents[1] / "app.py"
     names = {
         "ask", "build_dispute_map_prompt", "run_reserved_dispute_map",
-        "run_judge_intervention",
+        "mark_dispute_map_failed", "run_judge_intervention",
     }
     tree = ast.parse(source.read_text(encoding="utf-8"))
     functions = [
@@ -55,6 +56,9 @@ def app_functions():
         ),
         "selected_llm_mode": lambda: "real",
         "record_llm_call": Mock(),
+        "trace_event": Mock(),
+        "LLMError": LLMError,
+        "DatabaseError": DatabaseError,
         "logger": Mock(),
         "time": time,
     }
