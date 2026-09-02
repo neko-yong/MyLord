@@ -89,11 +89,15 @@ logger = logging.getLogger(__name__)
 
 
 def state_trace_enabled():
-    return os.environ.get("RERUN_STATE_TRACE") == "true"
+    return (
+        os.environ.get("RERUN_STATE_TRACE") == "true"
+        and (settings.dev_mode or settings.development_mode)
+    )
 
 
 def runtime_state():
     auth_state = st.session_state.get("auth") or {}
+    pending = st.session_state.get("_pending_confirmation") or {}
     snapshot = globals().get("page_snapshot") or {}
     case_state = snapshot.get("case") or {}
     rendered_tabs = globals().get("tabs", ())
@@ -108,6 +112,9 @@ def runtime_state():
         role_present=auth_state.get("role") in {"A", "B"},
         selected_tab=TAB_VIEWS.get(st.session_state.get("case_tab", TAB_LABELS[0]), "invalid"),
         render_branch="none", llm_started=False, llm_finished=False,
+        pending_confirmation=bool(pending),
+        confirmation_action=pending.get("action", "none"),
+        run_sequence=st.session_state.get("_freeze_trace_run_sequence", 0),
     )
 
 
@@ -447,6 +454,7 @@ def execute_confirmed_action(pending):
     pending_case_id = pending["case_id"]
     pending_role = pending["role"]
     payload = pending.get("payload", {})
+    persisted = True
 
     if action == "statement":
         content = payload.get("content")
@@ -471,14 +479,17 @@ def execute_confirmed_action(pending):
         database.cancel_arbitration_request(pending_case_id, pending_role)
     elif action == "pause":
         if not database.pause_case(pending_case_id, pending_role):
+            persisted = False
             st.session_state["_interaction_notice"] = "案件状态已经变化。"
     elif action == "resume":
         if not database.resume_case(pending_case_id, pending_role):
+            persisted = False
             st.session_state["_interaction_notice"] = "案件状态已经变化。"
     elif action == "judge_intervention":
         run_judge_intervention(pending_case_id)
     else:
         raise ValueError("无效的确认操作。")
+    return persisted
 
 
 @st.dialog(
@@ -510,10 +521,21 @@ def confirmation_dialog(pending):
         return
 
     trace_event("button_click")
+    trace_event(
+        "confirmation_received",
+        confirmation_action=pending["action"],
+        phase_outcome="enter",
+    )
     try:
-        execute_confirmed_action(pending)
+        persisted = execute_confirmed_action(pending)
     except StatementAlreadySubmitted:
         clear_pending_confirmation()
+        trace_event(
+            "pending_cleared",
+            pending_confirmation=False,
+            confirmation_action=pending["action"],
+            phase_outcome="complete",
+        )
         st.session_state["_interaction_notice"] = "独立陈述已经提交并冻结。"
         rerun()
     except CaseStateError as error:
@@ -526,8 +548,20 @@ def confirmation_dialog(pending):
         trace_event("action_failed")
         show_llm_error(error)
     else:
+        if persisted:
+            trace_event(
+                "action_persisted",
+                confirmation_action=pending["action"],
+                phase_outcome="complete",
+            )
         clear_pending_confirmation()
-        rerun()
+        trace_event(
+            "pending_cleared",
+            pending_confirmation=False,
+            confirmation_action=pending["action"],
+            phase_outcome="complete",
+        )
+        rerun(reason="confirmation_complete")
 
 
 def render_pending_confirmation(case_id, role):
@@ -657,6 +691,12 @@ def observe_fragment(name):
 
 def rerun(scope="app", reason="explicit"):
     trace_event("rerun_requested", requested_scope=scope)
+    if scope == "app":
+        trace_event(
+            "full_rerun_requested",
+            requested_scope=scope,
+            phase_outcome="rerun",
+        )
     if state_trace_enabled():
         st.session_state["_rerun_trace_reason"] = reason
     state_trace.finish_current()
@@ -668,12 +708,17 @@ performance_trace = start_trace(settings.perf_debug, "full_rerun", "app")
 st.session_state.setdefault("auth", None)
 runtime_trace = None
 if state_trace_enabled():
+    run_sequence = st.session_state.get("_freeze_trace_run_sequence", 0)
+    if type(run_sequence) is not int or run_sequence < 0:
+        run_sequence = 0
+    st.session_state["_freeze_trace_run_sequence"] = run_sequence + 1
     current_view = runtime_state()["selected_tab"]
     trace_reason = st.session_state.pop("_rerun_trace_reason", "initial_or_widget")
     if current_view != st.session_state.get("_rerun_trace_tab", current_view):
         trace_reason = "tab_change"
     st.session_state["_rerun_trace_tab"] = current_view
     runtime_trace = state_trace.start(True, "app", trace_reason, **runtime_state())
+    trace_event("new_run", phase_outcome="enter")
 if admin_route:
     render_admin_console(settings)
     stop()
@@ -1292,12 +1337,14 @@ if database_mode == "local":
     )
 else:
     st.caption("页面每 2 秒同步案件状态；对方的独立陈述正文不会显示。")
+trace_event("automatic_map_before", phase_outcome="enter")
 render_automatic_dispute_map(
     case_id,
     case,
     submitted,
     page_snapshot["artifacts"].get("DISPUTE_MAP"),
 )
+trace_event("automatic_map_after", phase_outcome="complete")
 
 revision_key = f"_case_revision_{case_id}_{role}"
 st.session_state[revision_key] = page_snapshot["revision"]
@@ -1311,6 +1358,7 @@ st.session_state[sync_skip_key] = True
 def live_case_sync():
     if st.session_state.pop(sync_skip_key, False):
         trace_event("poll_skipped")
+        trace_event("live_sync_rerun_decision", phase_outcome="skip")
         return
     try:
         trace_event("poll_started")
@@ -1324,21 +1372,23 @@ def live_case_sync():
                     revision_before=state_trace.revision_fingerprint(st.session_state.get(revision_key)),
                     revision_after=state_trace.revision_fingerprint(fresh_revision))
     if fresh_revision != st.session_state.get(revision_key):
+        trace_event("live_sync_rerun_decision", phase_outcome="rerun")
         rerun(reason="revision_changed")
+    trace_event("live_sync_rerun_decision", phase_outcome="complete")
 
-
-live_case_sync()
 
 if selected_view == "mediation":
     st.session_state[message_cache_key] = (
         cached_messages + page_snapshot["messages"]
     )
 
+trace_event("tabs_register_before", phase_outcome="enter")
 tabs = st.tabs(
     TAB_LABELS,
     key="case_tab",
     on_change="rerun",
 )
+trace_event("tabs_register_after", phase_outcome="complete")
 trace_event("tabs_registered", selected_tab_open_flags="".join("1" if tab.open else "0" for tab in tabs))
 
 if tabs[0].open:
@@ -1780,4 +1830,7 @@ st.caption(
 )
 finish_trace(performance_trace)
 trace_event("render_complete")
+trace_event("live_sync_before", phase_outcome="enter")
+live_case_sync()
+trace_event("live_sync_after", phase_outcome="complete")
 state_trace.finish(runtime_trace)

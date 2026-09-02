@@ -1,10 +1,40 @@
 # Navigation + Arbitration Freeze Gate
 
-Overall: FAIL — two evidenced recovery defects are repaired; the exact reported production blank-page / arbitration-confirmation freeze is not yet closed.
+Overall: CONDITIONAL FAIL — the isolated hotfix candidate passes the repeatable shared-rerun and 10×3 real-dialog gates; production closure still needs an authorized same-attempt trace and the real background/resume check.
+
+## 2026-09-02 shared confirmation recovery candidate
+
+The user-provided field record was treated as untrusted evidence and reduced to non-sensitive facts only. It reports the same one-client symptom after statement, pause and arbitration-accept confirmations, and after returning from background: title, status and A/B badges remain while navigation and content disappear; the other client can remain normal. No case identifier, title, statement, key, URL parameters or screenshot content was copied into code, logs or this report.
+
+That visible stop point matches one shared server order in the recorded code: `snapshot_refreshed` → title/status/badges → automatic-map check → `live_case_sync()` → `st.tabs(...)`. A deterministic equivalent-race test now runs each real action handler through the common confirmation path, consumes the full-run sync skip, then executes one queued sync fragment with a changed synthetic revision. Before the ordering fix, all three paths stopped at:
+
+`automatic_map_after → live_sync_before → live_sync_rerun_decision(rerun) → full_rerun_requested`
+
+There was no `tabs_register_after` and no `render_complete` in that run. Business writes still occurred once. This is a reliable equivalent reproduction of the reported render boundary, not a claim that the production connection/background trigger itself ran locally.
+
+The single new behavior change mounts/calls `live_case_sync` after the four tabs and selected content have emitted `render_complete`. Poll interval, revision comparison, full-rerun decision, database calls and authentication are unchanged. With the same injected queued fragment, all three paths now record `tabs_register_after` and `render_complete` before the sync rerun decision.
+
+Loopback Streamlit 1.62 browser acceptance used real `st.dialog` modals, synthetic in-memory data and a mock model:
+
+| Confirmation path | Consecutive passes | Active session | Peer session | Per-round side effects |
+| --- | ---: | --- | --- | --- |
+| Statement submit | 10/10 | Four tabs + statement content | Four tabs + content, A submission observed | `save_statement=1`; pause/arbitration/model = 0 |
+| Pause | 10/10 | Four tabs + mediation content, paused | Four tabs + content, paused observed | `pause_case=1`; statement/arbitration/model = 0 |
+| Arbitration accept | 10/10 | Four tabs + final content | Four tabs remain under the expected progress notification | `confirm_arbitration=1`; mock model = 3; statement/pause = 0 |
+
+Neither session used reload/new-tab recovery after confirmation. Active and peer browser-console error counts were both zero. Reset/navigation was used only before each fresh synthetic round. OS-level phone/background/sleep and a proven WebSocket disconnect/reconnect remain manual because the supported desktop browser surface cannot establish those conditions.
+
+## Reported deployment environment update
+
+User supplied on 2026-08-31: public homepage [application homepage](https://mylord-wrj9cnafjmvupnbsulyvvg.streamlit.app/), Lenovo Legion Y9000P, Chrome. These are user-reported environment facts, not a diagnosis. Chrome's exact version, deployed commit and server Streamlit version remain unknown. The laptop model does not identify an OS/browser version or establish device responsibility.
+
+Read-only root-page access did not yield page contents: browser navigation reported `net::ERR_CONNECTION_CLOSED`; an auxiliary web read failed to connect; subsequent observation of the browser page was explicitly blocked by the Browser URL security policy. All access to that URL stopped at the explicit block. No alternate browser, proxy, script, login, endpoint probe or policy bypass was used. Tool access failure is not evidence that the site is down for the user or that either case-level P0 was reproduced. Login-page content and public runtime/version information could not be confirmed.
+
+Relevant remaining differences: the verified tests used loopback, an in-app Chromium surface, Streamlit 1.62.0, synthetic memory data and mocked models; the reported URL is remote HTTPS and the user uses Chrome. Both local and recorded-baseline requirements say `streamlit>=1.62,<2`, not an exact 1.62.0 pin. This does not establish what the actual deployment installed. Confirm deployment/runtime/browser identity before attributing the failure to a version, network, device or either bounded code fix. No real configuration, credentials, case data or models were accessed. See the updated field evidence plan for the minimal non-sensitive evidence still required.
 
 ## Reproduction
 
-Blank-page reproduced: PARTIAL, not the complete reported symptom.
+Blank-page reproduced: RELIABLE EQUIVALENT at the reported render boundary; not reproduced against production or a real phone/background transition.
 Arbitration spinner reproduced: normal long-running spinner, YES; permanently spinning / all case tabs disappearing, NO.
 
 The user's refined paths are the primary acceptance cases:
@@ -29,8 +59,8 @@ Navigation root cause:
 
 Local implementation evidence: installed Streamlit spinner.py finally calls enqueue_message(clear_transient()); ScriptRunner checks pending execution-control requests when enqueuing. Browser traces independently show the model returned followed by an interrupted run with zero completion calls.
 
-Arbitration root cause: UNKNOWN for the reported production failure. Its successful final persistence already occurs inside the spinner; the map-specific ordering defect must not be presented as its proven root cause.
-Shared root cause: UNPROVEN.
+Arbitration root cause: the earlier map-specific persistence defect still does not apply to arbitration. The new controlled equivalent demonstrates a separate shared render-order defect: a queued `live_case_sync` full rerun can interrupt a post-confirmation full run before tabs are registered even though the action already persisted.
+Shared root cause: PROVEN for the deterministic equivalent race and aligned with the field screenshot boundary; production attribution remains conditional until a same-attempt sanitized trace shows the same phase sequence.
 
 Important mismatch: the reproduced snapshot failure has a visible error; the map hang retains the tab group. Neither completely matches “only title and A/B submitted badges remain.” Existing orphaned reservations are not repaired by this preventive patch.
 
@@ -48,11 +78,14 @@ After:
 
 tests/freeze_followup_evidence.json contains selected safe server excerpts and browser observations from these rounds. Full local logs are in ignored tests/artifacts/freeze-<pid>.log, with wall-clock timestamps and thread IDs. These are synthetic evidence, not production telemetry. Earlier tests/freeze_trace_sample.json remains a historical sample, not a full trace.
 
-Instrumentation remains default-off (RERUN_STATE_TRACE=true enables it). It allowlists event names, enums, booleans, tab flags, and revision digests; it adds no queries. No token, private body, prompt, exception detail, secret, or DSN is accepted by the state trace. The fixture logs operation names/ordinals/timing only. Server render_complete is not browser confirmation: DOM checks are recorded separately. Interrupted top-level runs are also identified by the test wrapper.
+Instrumentation remains default-off and can be enabled only when `RERUN_STATE_TRACE=true` and `DEV_MODE` or `DEVELOPMENT_MODE` is true. It now records the confirmation/persist/pending-clear/full-rerun, new-run/snapshot, automatic-map, live-sync decision, tabs and render-complete phases using only allowlisted action/result enums, booleans, an incrementing run sequence, elapsed time, tab flags and revision digests. It adds no queries. No case identifier, token, private body, prompt, URL, raw session state, API value, exception detail, secret or DSN is accepted. Server `render_complete` is not browser confirmation; DOM checks remain separate.
 
 ## Fix
 
 Files changed in this follow-up:
+- app.py: record safe confirmation/render phases and invoke live sync only after tabs and selected content render.
+- state_trace.py: strictly allowlist the new phase fields/events; keep tracing default-off and local/development-only.
+- tests/test_confirmation_rerun_order.py: deterministic failure-first equivalent race across statement, pause and arbitration-accept handlers.
 - app.py: persist successful map / mark failed map before spinner cleanup; retain selected tab and render a retry button after snapshot failure.
 - tests/test_app_auto_dispute_map.py: regression tests for success and failure interrupted at spinner cleanup.
 - tests/test_app_state_trace.py: consecutive snapshot failures, explicit recovery, retained auth/tab, one query per retry.
@@ -61,7 +94,7 @@ Files changed in this follow-up:
 - tests/run_offline_gate.py: explicitly mask both environment and Streamlit secrets test-DB sources; forbid real Python socket connections.
 - .gitignore, tests/freeze_followup_evidence.json and this report: local evidence handling.
 
-Minimal fix: settle the reservation before the existing Streamlit interruption boundary; add a single read-retry control. No background worker, tab.open override, architecture rollback, all-tab fetching, timeout increase, schema migration, or production-data repair.
+Minimal fixes across the freeze branch: settle the map reservation before the existing Streamlit interruption boundary; add a single read-retry control; mount live sync after stable navigation/content. No background worker, tab.open override, architecture rollback, all-tab fetching, timeout increase, schema migration, authentication persistence or production-data repair.
 Authentication semantics changed: NO. After both final results were observed, reloading the patched B browser returned to login as expected. No participant credential is persisted in a URL, localStorage, cookie, or added persistent session mechanism.
 
 Failure-first checks:
@@ -104,7 +137,7 @@ These are offline contract/fixture measurements, not live PostgreSQL latency/con
 ## Regression
 
 Full command from this worktree: python tests/run_offline_gate.py
-Result: 192 tests, 177 passed, 15 skipped, 42.612s.
+Result after the shared-rerun candidate: 195 tests, 180 passed, 15 skipped, 45.915s.
 
 Chat: PASS (normal/incremental cache and dual-client sync contracts; real browser message).
 Pause/Resume: PASS (tests and real browser).
@@ -140,9 +173,8 @@ Use mapOwnerInterruptionGate(a,b) from tests/freeze_browser_gate.mjs through the
 
 ## Remaining gate / evidence needed
 
-- Exact production “all tabs disappear after statement confirmation” remains unmatched.
-- Exact production blank/frozen UI after B's arbitration confirmation remains unmatched.
-- Affected deployment's precise revision, Streamlit version and browser version are not confirmed here. A sanitized same-attempt server trace plus browser DOM/console from an authorized reproduction is needed; no private cases, tokens, prompts or DSNs should be shared.
+- The field symptom now has a repeatable phase-equivalent reproduction for statement, pause and arbitration accept; production has not supplied a same-attempt sanitized phase trace, so production attribution remains conditional.
+- Public homepage, Y9000P device and Chrome name are now supplied. Precise deployed revision, server Streamlit version and Chrome version are still unconfirmed; public-page access was policy-blocked. A sanitized same-attempt server trace plus narrow browser state observations from an authorized reproduction are needed; no private cases, tokens, prompts, DSNs or full HAR/DOM should be shared.
 - OS foreground/background window switching, sleeping/disconnected browser recovery, hour-long sessions, real network/proxy failure and PostgreSQL concurrency were not validated. Two independent browser tabs are not proof of those behaviors.
 - Existing abandoned map reservations and process termination during generation remain outside the preventive ordering fix.
 - No change to refresh/login behavior is authorized in this phase.
@@ -161,4 +193,4 @@ Merged main: NO
 Pushed main: NO
 Deployed: NO
 
-Safe for integration review: NO as a completed P0 hotfix. The two bounded fixes are reviewable, but the reported production failures are not declared solved.
+Safe for integration review: YES as an isolated candidate with a passing local gate. Safe to deploy/declare the production P0 closed: NO without the separately authorized production canary, same-attempt sanitized trace, and real background/resume check.

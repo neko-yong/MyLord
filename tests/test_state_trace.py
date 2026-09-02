@@ -39,6 +39,31 @@ class StateTraceTests(unittest.TestCase):
         for key in trace.DEFAULTS:
             self.assertIn(f'"{key}"', self.output.getvalue())
 
+    def test_phase_fields_accept_only_bounded_sanitized_values(self):
+        current = trace.start(
+            True,
+            "app",
+            "confirmation_complete",
+            confirmation_action="pause",
+            pending_confirmation=True,
+            phase_outcome="enter",
+            run_sequence=7,
+        )
+        trace.event(
+            "pending_cleared",
+            confirmation_action="private-action",
+            pending_confirmation=False,
+            phase_outcome="private-result",
+            run_sequence="private-sequence",
+        )
+        trace.finish(current)
+        output = self.output.getvalue()
+        self.assertIn('"confirmation_action": "invalid"', output)
+        self.assertIn('"pending_confirmation": false', output)
+        self.assertIn('"phase_outcome": "invalid"', output)
+        self.assertIn('"run_sequence": 0', output)
+        self.assertNotIn("private-action", output)
+
     def test_fragment_scope_and_parent_are_restored_on_exception(self):
         @trace.observe_fragment("case_sync", lambda: True, lambda: {"authenticated": True})
         def fragment():

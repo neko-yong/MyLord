@@ -20,7 +20,13 @@ from dev_memory_db import DevMemoryDatabase, new_dev_local_store
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = subprocess.check_output(
-    ["git", "show", "bef2e47d58a018c2ccf87458a5ff4a9fe38be2d1:app.py"],
+    [
+        "git",
+        "-c",
+        f"safe.directory={ROOT}",
+        "show",
+        "bef2e47d58a018c2ccf87458a5ff4a9fe38be2d1:app.py",
+    ],
     cwd=ROOT,
 ).decode("utf-8")
 LOCAL = SimpleNamespace(dev_mode=True, dev_database_mode="local")
@@ -36,6 +42,7 @@ if os.environ.get("FREEZE_GATE_START") != "collecting":
     MEMORY.complete_artifact(CASE_ID, reservation, "DISPUTE_MAP", "Synthetic dispute map")
 CALLS = Counter()
 LOCK = threading.RLock()
+RESET_STATE = {"nonce": None, "scenario": "map_ready", "seen": set()}
 LOG = logging.getLogger("freeze_browser_gate")
 LOG.setLevel(logging.WARNING)
 DELAYS = json.loads(os.environ.get("FREEZE_GATE_DELAYS", "{}"))
@@ -48,6 +55,39 @@ handler = logging.FileHandler(ARTIFACT_DIR / f"freeze-{os.getpid()}.log", encodi
 handler.setFormatter(logging.Formatter("%(created).6f thread=%(thread)d %(message)s"))
 for name in ("freeze_browser_gate", "state_trace", "performance"):
     logging.getLogger(name).addHandler(handler)
+
+
+def reset_fixture(scenario, nonce):
+    """Reset only this loopback fixture, once for all sessions sharing a nonce."""
+    global CASE_ID
+    if scenario not in {"statement", "pause", "arbitration_accept"}:
+        raise ValueError("Unsupported local freeze-gate scenario")
+    if not isinstance(nonce, str) or not nonce.isascii() or not nonce.isalnum():
+        raise ValueError("Invalid local freeze-gate nonce")
+    with LOCK:
+        if nonce in RESET_STATE["seen"]:
+            return CASE_ID
+        MEMORY.reset()
+        CASE_ID, _, _ = MEMORY.create_case("[DEV_TEST] Freeze confirmation gate")
+        STORE["cases"][CASE_ID]["a_token_hash"] = hash_token("A-browser-fixture")
+        STORE["cases"][CASE_ID]["b_token_hash"] = hash_token("B-browser-fixture")
+        if scenario in {"pause", "arbitration_accept"}:
+            MEMORY.save_statement(CASE_ID, "A", "Synthetic A statement for confirmation gate")
+            MEMORY.save_statement(CASE_ID, "B", "Synthetic B statement for confirmation gate")
+            reservation = MEMORY.claim_artifact(CASE_ID, "DISPUTE_MAP")
+            MEMORY.complete_artifact(
+                CASE_ID,
+                reservation,
+                "DISPUTE_MAP",
+                "Synthetic dispute map for confirmation gate",
+            )
+        if scenario == "arbitration_accept":
+            MEMORY.request_arbitration(CASE_ID, "A")
+        CALLS.clear()
+        RESET_STATE["seen"].add(nonce)
+        RESET_STATE.update(nonce=nonce, scenario=scenario)
+        LOG.warning("GATE fixture_reset=%s", scenario)
+        return CASE_ID
 
 
 def begin_operation(name, default_delay=0):
@@ -102,6 +142,7 @@ SETTINGS = config.Settings(
     admin_create_secret="",
     admin_console_route_key="",
     admin_maintenance_secret="",
+    development_mode=True,
     perf_debug=True,
 )
 config.load_settings = lambda *_args, **_kwargs: SETTINGS

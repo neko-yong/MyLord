@@ -19,9 +19,19 @@ VIEWS = {"statement", "dispute", "mediation", "final", "none", "invalid"}
 REASONS = {
     "initial_or_widget", "tab_change", "explicit", "revision_changed",
     "case_sync", "mediation_room", "confirmation_dialog", "notification_dialog",
+    "confirmation_complete",
 }
+CONFIRMATION_ACTIONS = {
+    "statement", "arbitration_request", "arbitration_accept",
+    "arbitration_decline", "pause", "resume", "judge_intervention", "none",
+}
+PHASE_OUTCOMES = {"enter", "complete", "skip", "rerun", "none"}
 EVENTS = {
     "run_start", "run_exit", "stop", "rerun_requested", "button_click",
+    "new_run", "confirmation_received", "action_persisted", "pending_cleared",
+    "full_rerun_requested", "automatic_map_before", "automatic_map_after",
+    "live_sync_before", "live_sync_after", "live_sync_rerun_decision",
+    "tabs_register_before", "tabs_register_after",
     "snapshot_started", "snapshot_refreshed", "snapshot_failed", "snapshot_missing",
     "tabs_registered", "render_branch_entered", "render_complete",
     "poll_started", "poll_finished", "poll_failed", "poll_skipped",
@@ -36,7 +46,8 @@ DEFAULTS = {
     "authenticated": False, "case_id_present": False, "role_present": False,
     "snapshot_present": False, "revision_before": "none", "revision_after": "none",
     "llm_started": False, "llm_finished": False, "render_branch": "none",
-    "requested_scope": "none",
+    "requested_scope": "none", "pending_confirmation": False,
+    "confirmation_action": "none", "phase_outcome": "none", "run_sequence": 0,
 }
 
 
@@ -51,10 +62,16 @@ def revision_fingerprint(revision):
 def _safe_field(name, value):
     if isinstance(DEFAULTS[name], bool):
         return value if isinstance(value, bool) else False
+    if name == "run_sequence":
+        return value if type(value) is int and 0 <= value <= 1_000_000 else 0
     if name in {"case_status", "arbitration_state"}:
         allowed = STATUSES
     elif name in {"selected_tab", "render_branch"}:
         allowed = VIEWS
+    elif name == "confirmation_action":
+        allowed = CONFIRMATION_ACTIONS
+    elif name == "phase_outcome":
+        allowed = PHASE_OUTCOMES
     elif name == "requested_scope":
         allowed = {"app", "fragment", "none"}
     elif name == "selected_tab_open_flags":

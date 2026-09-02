@@ -53,6 +53,7 @@ class AppStateTraceTests(unittest.TestCase):
             patch.dict(os.environ, {
                 "DATABASE_URL": f"postgresql://trace-fixture/{id(database)}",
                 "LLM_ENDPOINT": "", "LLM_MODEL": "", "LLM_API_KEY": "",
+                "DEVELOPMENT_MODE": "true",
                 "RERUN_STATE_TRACE": "true" if enabled else "false",
             }),
             patch("streamlit.runtime.secrets.Secrets.load_if_toml_exists", return_value=False),
@@ -95,6 +96,23 @@ class AppStateTraceTests(unittest.TestCase):
         completed = next(line for line in captured.output if '"event": "render_complete"' in line)
         self.assertIn('"selected_tab_open_flags": "0100"', completed)
         self.assertIn('"render_branch": "dispute"', completed)
+
+    def test_trace_cannot_be_enabled_outside_local_or_development_mode(self):
+        database = FakeDatabase("MEDIATING")
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
+        app.session_state["auth"] = {"case_id": "CASE-UI", "role": "A"}
+        with (
+            patch.dict(os.environ, {
+                "DATABASE_URL": f"postgresql://trace-prod-gate/{id(database)}",
+                "DEVELOPMENT_MODE": "false", "DEV_MODE": "false",
+                "RERUN_STATE_TRACE": "true",
+            }, clear=True),
+            patch("streamlit.runtime.secrets.Secrets.load_if_toml_exists", return_value=False),
+            patch("db.Database", return_value=database),
+            self.assertNoLogs("state_trace", level="WARNING"),
+        ):
+            app.run(timeout=15)
+        self.assertFalse(app.exception)
 
 
 if __name__ == "__main__":
