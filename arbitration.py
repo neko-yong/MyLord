@@ -1,5 +1,4 @@
 import time
-import state_trace
 
 from db import CaseStateError, DatabaseUnavailable
 from evidence import format_evidence_history
@@ -73,7 +72,6 @@ def run_final_arbitration(
             if meta_checkpoint.get("evidence_hash") != snapshot_hash:
                 raise CaseStateError("Meta 检查点与冻结证据不一致。")
             final_result = meta_checkpoint["content"]
-            state_trace.event("artifact_persist_started")
             retry_database_write(
                 lambda: database.complete_artifact(
                     case_id,
@@ -83,7 +81,6 @@ def run_final_arbitration(
                 ),
                 sleep=sleep,
             )
-            state_trace.event("artifact_persisted", arbitration_state="CLOSED")
             return final_result
 
     a = snapshot["a_statement"]
@@ -169,7 +166,6 @@ def run_final_arbitration(
             sleep,
         )
 
-    state_trace.event("artifact_persist_started")
     retry_database_write(
         lambda: database.complete_artifact(
             case_id,
@@ -179,5 +175,4 @@ def run_final_arbitration(
         ),
         sleep=sleep,
     )
-    state_trace.event("artifact_persisted", arbitration_state="CLOSED")
     return final_result

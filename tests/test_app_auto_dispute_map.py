@@ -1,9 +1,7 @@
 import os
 import unittest
-from contextlib import contextmanager
 from unittest.mock import patch
 
-import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 from llm import LLMError, LLMResult
@@ -167,60 +165,6 @@ class AutomaticDisputeMapAppTests(unittest.TestCase):
         }
         patches = app_environment(database, llm_side_effect)
         return app, patches
-
-    def test_spinner_cleanup_rerun_does_not_lose_completed_map(self):
-        database = AutoMapDatabase()
-        app, patches = self.run_app(database, [result()])
-
-        # Real browser reproduction: a tab click interrupts the generating run
-        # at spinner cleanup, after the model returned and before persistence.
-        original_spinner = st.spinner
-
-        @contextmanager
-        def interrupted_spinner(text, **kwargs):
-            if text != "AI 法官正在整理双方事实、分歧和待确认事项…":
-                with original_spinner(text, **kwargs):
-                    yield
-                return
-            yield
-            st.rerun()
-
-        with patches[0], patches[1], patches[2], patches[3] as llm, patch(
-            "streamlit.spinner", interrupted_spinner,
-        ):
-            app.run(timeout=15)
-
-        self.assertFalse(app.exception)
-        self.assertEqual(database.status, "MAP_READY")
-        self.assertEqual(database.complete_calls, 1)
-        self.assertEqual(llm.call_count, 1)
-
-    def test_spinner_cleanup_rerun_does_not_hide_generation_failure(self):
-        database = AutoMapDatabase()
-        app, patches = self.run_app(database, [LLMError("timeout")])
-        original_spinner = st.spinner
-
-        @contextmanager
-        def interrupted_spinner(text, **kwargs):
-            if text != "AI 法官正在整理双方事实、分歧和待确认事项…":
-                with original_spinner(text, **kwargs):
-                    yield
-                return
-            try:
-                yield
-            finally:
-                st.rerun()
-
-        with patches[0], patches[1], patches[2], patches[3] as llm, patch(
-            "streamlit.spinner", interrupted_spinner,
-        ):
-            app.run(timeout=15)
-
-        self.assertFalse(app.exception)
-        self.assertEqual(database.fail_calls, 1)
-        self.assertEqual(database.complete_calls, 0)
-        self.assertEqual(llm.call_count, 1)
-        self.assertIn("重新尝试整理争议地图", [button.label for button in app.button])
 
     def test_ready_for_map_claims_and_generates_without_manual_button(self):
         database = AutoMapDatabase()

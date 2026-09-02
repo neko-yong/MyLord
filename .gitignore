@@ -7,4 +7,3 @@ __pycache__/
 .venv/
 .uv-cache/
 .idea/
-/tests/artifacts/
