@@ -3,6 +3,7 @@ import os
 import time
 
 import streamlit as st
+import state_trace
 
 from admin_console import is_admin_route, render_admin_console
 from arbitration import retry_database_write, run_final_arbitration
@@ -26,6 +27,7 @@ from dev_tools import (
     seed_dev_case,
     switch_dev_role,
 )
+from dispute_map_view import render_dispute_map, render_mediation_context
 from llm import LLMError, TASK_MAX_TOKENS, call_llm
 from mock_llm import MockLLM
 from performance import (
@@ -84,6 +86,51 @@ TAB_VIEWS = dict(zip(TAB_LABELS, ("statement", "dispute", "mediation", "final"))
 
 
 logger = logging.getLogger(__name__)
+
+
+def state_trace_enabled():
+    return (
+        os.environ.get("RERUN_STATE_TRACE") == "true"
+        and (settings.dev_mode or settings.development_mode)
+    )
+
+
+def runtime_state():
+    auth_state = st.session_state.get("auth") or {}
+    pending = st.session_state.get("_pending_confirmation") or {}
+    snapshot = globals().get("page_snapshot") or {}
+    case_state = snapshot.get("case") or {}
+    rendered_tabs = globals().get("tabs", ())
+    return dict(
+        case_status=case_state.get("status", "unknown"),
+        arbitration_state=case_state.get("status", "unknown"),
+        snapshot_present=bool(snapshot),
+        revision_after=state_trace.revision_fingerprint(snapshot.get("revision")),
+        selected_tab_open_flags="".join("1" if tab.open else "0" for tab in rendered_tabs),
+        authenticated=bool(auth_state),
+        case_id_present=bool(auth_state.get("case_id")),
+        role_present=auth_state.get("role") in {"A", "B"},
+        selected_tab=TAB_VIEWS.get(st.session_state.get("case_tab", TAB_LABELS[0]), "invalid"),
+        render_branch="none", llm_started=False, llm_finished=False,
+        pending_confirmation=bool(pending),
+        confirmation_action=pending.get("action", "none"),
+        run_sequence=st.session_state.get("_freeze_trace_run_sequence", 0),
+    )
+
+
+def trace_event(name, **fields):
+    state_trace.event(name, **fields)
+
+
+def trace_fragment(name):
+    return state_trace.observe_fragment(name, state_trace_enabled, runtime_state)
+
+
+def stop():
+    if state_trace_enabled():
+        trace_event("stop", **runtime_state())
+    state_trace.finish_current()
+    st.stop()
 
 
 def show_database_error(error):
@@ -213,19 +260,26 @@ def build_dispute_map_prompt(statements):
 
 
 def run_reserved_dispute_map(case_id, reservation_id):
-    statements = database.get_statements_for_llm(case_id)
     with st.spinner("AI 法官正在整理双方事实、分歧和待确认事项…"):
-        result = ask(
-            DISPUTE_MAP_PROMPT,
-            build_dispute_map_prompt(statements),
-            max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
-        )
-    database.complete_artifact(
-        case_id,
-        reservation_id,
-        "DISPUTE_MAP",
-        result.content,
-    )
+        # Spinner cleanup can interrupt this run. Settle the reservation first.
+        try:
+            statements = database.get_statements_for_llm(case_id)
+            result = ask(
+                DISPUTE_MAP_PROMPT,
+                build_dispute_map_prompt(statements),
+                max_tokens=TASK_MAX_TOKENS["DISPUTE_MAP"],
+            )
+            trace_event("artifact_persist_started")
+            database.complete_artifact(
+                case_id,
+                reservation_id,
+                "DISPUTE_MAP",
+                result.content,
+            )
+            trace_event("artifact_persisted")
+        except (LLMError, DatabaseError):
+            mark_dispute_map_failed(case_id, reservation_id)
+            raise
 
 
 def mark_dispute_map_failed(case_id, reservation_id):
@@ -240,14 +294,12 @@ def finish_dispute_map_generation(case_id, reservation_id):
     try:
         run_reserved_dispute_map(case_id, reservation_id)
     except LLMError as error:
-        mark_dispute_map_failed(case_id, reservation_id)
         show_llm_error(error)
         st.warning(
             "独立陈述已经成功冻结，争议地图尚未生成。请稍后重新尝试。"
         )
         return False
     except DatabaseError as error:
-        mark_dispute_map_failed(case_id, reservation_id)
         show_database_error(error)
         return False
     return True
@@ -402,6 +454,7 @@ def execute_confirmed_action(pending):
     pending_case_id = pending["case_id"]
     pending_role = pending["role"]
     payload = pending.get("payload", {})
+    persisted = True
 
     if action == "statement":
         content = payload.get("content")
@@ -409,9 +462,15 @@ def execute_confirmed_action(pending):
             raise ValueError("待提交的独立陈述无效。")
         database.save_statement(pending_case_id, pending_role, content)
     elif action == "arbitration_request":
+        trace_event("db_request_started")
         database.request_arbitration(pending_case_id, pending_role)
+        trace_event("db_request_finished")
+        trace_event("state_transition", arbitration_state="ARBITRATION_PENDING")
     elif action == "arbitration_accept":
+        trace_event("evidence_freeze_started")
         database.confirm_arbitration(pending_case_id, pending_role)
+        trace_event("evidence_freeze_finished")
+        trace_event("state_transition", arbitration_state="ARBITRATING")
         if not start_or_resume_final_arbitration(pending_case_id):
             st.session_state["_interaction_notice"] = (
                 "证据已冻结；模型流程可在服务恢复后从同一 Snapshot 继续。"
@@ -420,14 +479,17 @@ def execute_confirmed_action(pending):
         database.cancel_arbitration_request(pending_case_id, pending_role)
     elif action == "pause":
         if not database.pause_case(pending_case_id, pending_role):
+            persisted = False
             st.session_state["_interaction_notice"] = "案件状态已经变化。"
     elif action == "resume":
         if not database.resume_case(pending_case_id, pending_role):
+            persisted = False
             st.session_state["_interaction_notice"] = "案件状态已经变化。"
     elif action == "judge_intervention":
         run_judge_intervention(pending_case_id)
     else:
         raise ValueError("无效的确认操作。")
+    return persisted
 
 
 @st.dialog(
@@ -436,6 +498,7 @@ def execute_confirmed_action(pending):
     icon=":material/warning:",
 )
 @measure_fragment("confirmation_dialog", lambda: settings.perf_debug)
+@trace_fragment("confirmation_dialog")
 def confirmation_dialog(pending):
     copy = CONFIRMATION_COPY[pending["action"]]
     st.markdown(f"### {copy['heading']}")
@@ -457,21 +520,48 @@ def confirmation_dialog(pending):
     if not confirm:
         return
 
+    trace_event("button_click")
+    trace_event(
+        "confirmation_received",
+        confirmation_action=pending["action"],
+        phase_outcome="enter",
+    )
     try:
-        execute_confirmed_action(pending)
+        persisted = execute_confirmed_action(pending)
     except StatementAlreadySubmitted:
         clear_pending_confirmation()
+        trace_event(
+            "pending_cleared",
+            pending_confirmation=False,
+            confirmation_action=pending["action"],
+            phase_outcome="complete",
+        )
         st.session_state["_interaction_notice"] = "独立陈述已经提交并冻结。"
         rerun()
     except CaseStateError as error:
+        trace_event("action_failed")
         st.warning(str(error))
     except DatabaseError as error:
+        trace_event("action_failed")
         show_database_error(error)
     except LLMError as error:
+        trace_event("action_failed")
         show_llm_error(error)
     else:
+        if persisted:
+            trace_event(
+                "action_persisted",
+                confirmation_action=pending["action"],
+                phase_outcome="complete",
+            )
         clear_pending_confirmation()
-        rerun()
+        trace_event(
+            "pending_cleared",
+            pending_confirmation=False,
+            confirmation_action=pending["action"],
+            phase_outcome="complete",
+        )
+        rerun(reason="confirmation_complete")
 
 
 def render_pending_confirmation(case_id, role):
@@ -495,6 +585,7 @@ def render_pending_confirmation(case_id, role):
     icon=":material/notifications:",
 )
 @measure_fragment("notification_dialog", lambda: settings.perf_debug)
+@trace_fragment("notification_dialog")
 def notification_dialog(notification, case_id, role):
     actor = notification["actor_role"]
     if notification["event_type"] == "ARBITRATION_ACCEPTED":
@@ -523,6 +614,7 @@ def notification_dialog(notification, case_id, role):
                 notification["id"],
                 role,
             )
+            trace_event("notification_ack")
         except DatabaseError as error:
             show_database_error(error)
         else:
@@ -537,6 +629,7 @@ def ask(
 ):
     llm_mode = selected_llm_mode()
     started = time.perf_counter()
+    trace_event("llm_started", llm_started=True, llm_finished=False)
     try:
         if llm_mode == "mock":
             result = active_mock_llm()(
@@ -563,6 +656,11 @@ def ask(
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
+    except LLMError:
+        trace_event("llm_failed")
+        raise
+    else:
+        trace_event("llm_finished", llm_finished=True)
     finally:
         record_llm_call(
             llm_mode,
@@ -591,16 +689,39 @@ def observe_fragment(name):
     return measure_fragment(name, enabled)
 
 
-def rerun(scope="app"):
+def rerun(scope="app", reason="explicit"):
+    trace_event("rerun_requested", requested_scope=scope)
+    if scope == "app":
+        trace_event(
+            "full_rerun_requested",
+            requested_scope=scope,
+            phase_outcome="rerun",
+        )
+    if state_trace_enabled():
+        st.session_state["_rerun_trace_reason"] = reason
+    state_trace.finish_current()
     finish_current_trace()
     st.rerun(scope=scope)
 
 
 performance_trace = start_trace(settings.perf_debug, "full_rerun", "app")
 st.session_state.setdefault("auth", None)
+runtime_trace = None
+if state_trace_enabled():
+    run_sequence = st.session_state.get("_freeze_trace_run_sequence", 0)
+    if type(run_sequence) is not int or run_sequence < 0:
+        run_sequence = 0
+    st.session_state["_freeze_trace_run_sequence"] = run_sequence + 1
+    current_view = runtime_state()["selected_tab"]
+    trace_reason = st.session_state.pop("_rerun_trace_reason", "initial_or_widget")
+    if current_view != st.session_state.get("_rerun_trace_tab", current_view):
+        trace_reason = "tab_change"
+    st.session_state["_rerun_trace_tab"] = current_view
+    runtime_trace = state_trace.start(True, "app", trace_reason, **runtime_state())
+    trace_event("new_run", phase_outcome="enter")
 if admin_route:
     render_admin_console(settings)
-    st.stop()
+    stop()
 if settings.dev_mode:
     st.session_state.setdefault(
         "dev_database_mode",
@@ -730,7 +851,7 @@ def render_developer_playground():
         )
         if database_mode not in {"local", "postgres"}:
             st.error("数据库模式无效。")
-            st.stop()
+            stop()
 
         with st.container(horizontal=True):
             st.badge("DEV_MODE: ON", color="green")
@@ -980,7 +1101,7 @@ if database_mode == "postgres" and not settings.database_url:
         icon=":material/database:",
     )
     st.caption("生产环境不会自动回落到本地 SQLite。")
-    st.stop()
+    stop()
 
 if database_mode == "local":
     if "_dev_local_store" not in st.session_state:
@@ -999,7 +1120,7 @@ else:
             st.subheader("服务状态")
             st.badge("数据库连接失败", color="red", icon=":material/database:")
         show_database_error(error)
-        st.stop()
+        stop()
 
 database = instrument_database(database, settings.perf_debug)
 
@@ -1120,7 +1241,7 @@ if not auth:
         "AI 法官会读取双方陈述，用于生成结构化争议地图与仲裁分析。",
         icon=":material/privacy_tip:",
     )
-    st.stop()
+    stop()
 
 
 case_id = auth.get("case_id", "")
@@ -1131,7 +1252,7 @@ if role not in {"A", "B"}:
     else:
         st.session_state.auth = None
     st.error("当前登录状态无效，请重新进入案件。")
-    st.stop()
+    stop()
 
 selected_tab = st.session_state.get("case_tab", TAB_LABELS[0])
 if selected_tab not in TAB_VIEWS:
@@ -1149,6 +1270,10 @@ last_message_id = (
 )
 
 try:
+    if state_trace_enabled():
+        trace_event("snapshot_started", selected_tab=selected_view,
+                    snapshot_present=False, revision_before=state_trace.revision_fingerprint(
+                        st.session_state.get(f"_case_revision_{case_id}_{role}")))
     page_snapshot = database.get_case_view_snapshot(
         case_id,
         role,
@@ -1156,18 +1281,27 @@ try:
         last_message_id,
     )
 except DatabaseError as error:
+    trace_event("snapshot_failed")
     show_database_error(error)
-    st.stop()
+    # Keep the selected widget value when this run cannot render the tabs.
+    st.session_state["case_tab"] = selected_tab
+    st.button("重试加载案件", key="retry_case_snapshot")
+    stop()
 
 if not page_snapshot:
+    trace_event("snapshot_missing", snapshot_present=False)
     if auth.get("dev"):
         clear_dev_case_state()
     else:
         st.session_state.auth = None
     st.error("案件不存在或已不可用，请重新进入。")
-    st.stop()
+    stop()
 
 case = page_snapshot["case"]
+if state_trace_enabled():
+    trace_event("snapshot_refreshed", snapshot_present=True, case_status=case["status"],
+                arbitration_state=case["status"],
+                revision_after=state_trace.revision_fingerprint(page_snapshot["revision"]))
 other = "B" if role == "A" else "A"
 st.subheader(case["title"])
 if interaction_notice := st.session_state.pop("_interaction_notice", None):
@@ -1203,12 +1337,14 @@ if database_mode == "local":
     )
 else:
     st.caption("页面每 2 秒同步案件状态；对方的独立陈述正文不会显示。")
+trace_event("automatic_map_before", phase_outcome="enter")
 render_automatic_dispute_map(
     case_id,
     case,
     submitted,
     page_snapshot["artifacts"].get("DISPUTE_MAP"),
 )
+trace_event("automatic_map_after", phase_outcome="complete")
 
 revision_key = f"_case_revision_{case_id}_{role}"
 st.session_state[revision_key] = page_snapshot["revision"]
@@ -1218,32 +1354,45 @@ st.session_state[sync_skip_key] = True
 
 @st.fragment(run_every=AUTO_REFRESH_INTERVAL)
 @observe_fragment("case_sync")
+@trace_fragment("case_sync")
 def live_case_sync():
     if st.session_state.pop(sync_skip_key, False):
+        trace_event("poll_skipped")
+        trace_event("live_sync_rerun_decision", phase_outcome="skip")
         return
     try:
+        trace_event("poll_started")
         fresh_revision = database.get_case_revision(case_id, role)
     except DatabaseError as error:
+        trace_event("poll_failed")
         show_database_error(error)
         return
+    if state_trace_enabled():
+        trace_event("poll_finished",
+                    revision_before=state_trace.revision_fingerprint(st.session_state.get(revision_key)),
+                    revision_after=state_trace.revision_fingerprint(fresh_revision))
     if fresh_revision != st.session_state.get(revision_key):
-        rerun()
+        trace_event("live_sync_rerun_decision", phase_outcome="rerun")
+        rerun(reason="revision_changed")
+    trace_event("live_sync_rerun_decision", phase_outcome="complete")
 
-
-live_case_sync()
 
 if selected_view == "mediation":
     st.session_state[message_cache_key] = (
         cached_messages + page_snapshot["messages"]
     )
 
+trace_event("tabs_register_before", phase_outcome="enter")
 tabs = st.tabs(
     TAB_LABELS,
     key="case_tab",
     on_change="rerun",
 )
+trace_event("tabs_register_after", phase_outcome="complete")
+trace_event("tabs_registered", selected_tab_open_flags="".join("1" if tab.open else "0" for tab in tabs))
 
 if tabs[0].open:
+    trace_event("render_branch_entered", render_branch="statement")
     with tabs[0]:
         st.markdown("### 你的独立陈述")
         st.caption("这一阶段互相不可见。提交后冻结，避免看到对方版本后修改自己的叙述。")
@@ -1320,13 +1469,14 @@ if tabs[0].open:
         )
 
 if tabs[1].open:
+    trace_event("render_branch_entered", render_branch="dispute")
     with tabs[1]:
         st.markdown("### 争议地图")
         submission_status = page_snapshot["submitted"]
         dispute = page_snapshot["artifacts"].get("DISPUTE_MAP")
 
         if dispute and dispute["content"]:
-            st.markdown(dispute["content"])
+            render_dispute_map(dispute["content"])
         elif dispute and dispute.get("generation_failed_at"):
             st.warning(
                 "争议地图整理失败，但双方独立陈述已经安全冻结。"
@@ -1343,11 +1493,14 @@ if tabs[1].open:
             st.info("双方独立陈述已提交，系统将自动开始整理争议地图。")
 
 if tabs[2].open:
+    trace_event("render_branch_entered", render_branch="mediation")
     with tabs[2]:
         st.markdown("### 共享调解室")
+        render_mediation_context(page_snapshot["artifacts"].get("DISPUTE_MAP"))
 
         @st.fragment
         @observe_fragment("mediation_room")
+        @trace_fragment("mediation_room")
         def shared_mediation_room():
             current_case = page_snapshot["case"]
             dispute = page_snapshot["artifacts"].get("DISPUTE_MAP")
@@ -1503,6 +1656,7 @@ if tabs[2].open:
         shared_mediation_room()
 
 if tabs[3].open:
+    trace_event("render_branch_entered", render_branch="final")
     with tabs[3]:
         st.markdown("### 最终仲裁")
         current_case = page_snapshot["case"]
@@ -1675,3 +1829,8 @@ st.caption(
     "如果涉及现实的人身威胁、暴力或胁迫，应优先处理现实安全。"
 )
 finish_trace(performance_trace)
+trace_event("render_complete")
+trace_event("live_sync_before", phase_outcome="enter")
+live_case_sync()
+trace_event("live_sync_after", phase_outcome="complete")
+state_trace.finish(runtime_trace)

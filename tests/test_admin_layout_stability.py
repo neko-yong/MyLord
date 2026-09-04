@@ -87,6 +87,9 @@ class AdminLayoutStabilityTests(unittest.TestCase):
         admin_tests.find(app.button, "Permanently delete").click()
         self._run_and_capture(app, database, "delete confirmation")
 
+        admin_tests.find(app.checkbox, "我确认删除这个案件，且无法恢复").check()
+        self._run_and_capture(app, database, "delete acknowledgement")
+
         admin_tests.find(app.button, "Cancel").click()
         self._run_and_capture(app, database, "cancel delete")
         self.assertEqual(database.delete_calls, [])
